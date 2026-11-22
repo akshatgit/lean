@@ -125,11 +125,18 @@ class Opaque:
     call: str
     reason: str
     line: int = 0
+    # Opacity has two independent consequences for a verdict:
+    #   may_block        - an unmodeled guard/denial might exist here, so a Lean
+    #                      counterexample that passes this point is only a lead
+    #                      (blocks VIOLATION).
+    #   may_have_effects - an unmodeled read/write might exist here, so the modeled
+    #                      effects may be incomplete (blocks SAFE / no_effects).
     may_block: bool = True
+    may_have_effects: bool = True
 
     def to_json(self) -> dict:
         return {"call": self.call, "reason": self.reason, "line": self.line,
-                "may_block": self.may_block}
+                "may_block": self.may_block, "may_have_effects": self.may_have_effects}
 
 
 @dataclass

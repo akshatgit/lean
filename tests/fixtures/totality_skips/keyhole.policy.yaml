@@ -1,0 +1,14 @@
+principal:
+  id: current_user.id
+resources:
+  User:
+    confirmed: true
+    read: "true"
+  Flow:
+    confirmed: true
+    read: owner(user_id)
+    update: owner(user_id)
+    delete: owner(user_id)
+  Record:
+    confirmed: true
+    read: "true"

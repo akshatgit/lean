@@ -22,13 +22,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .. import air
+from .purity import Purity
 from ..summaries import instantiate
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 QUERY_PASSTHROUGH = {"first", "one", "one_or_none", "scalar_one_or_none", "scalar_one",
                      "all", "scalars", "scalar", "unique", "limit", "offset", "order_by",
                      "options", "distinct"}
-SKIP_DIRS = {".keyhole", ".git", ".venv", "venv", "node_modules", "__pycache__", ".lake"}
+# site-packages/dist-packages: an environment checked out inside the repository is
+# third-party code, not the application.  Treating it as "repository source" would let
+# the adapter resolve application calls into unrelated installed packages.
+SKIP_DIRS = {".keyhole", ".git", ".venv", "venv", "node_modules", "__pycache__", ".lake",
+             "site-packages", "dist-packages"}
 TEST_FILES = {"conftest.py"}
 TYPE_MAP = {"int": "int", "str": "str", "bool": "bool", "UUID": "uuid", "uuid": "uuid"}
 IGNORED_CALLS = {
@@ -158,6 +163,9 @@ class _RepoIndex:
                         if dotted:
                             self.global_types[(module, node.target.id)] = dotted
         self._index_router_auth(parsed)
+        # Effect-freedom oracle (see purity.py): the only authority allowed to say a
+        # call cannot touch the database.
+        self.purity = Purity(self, models, policy)
 
     @staticmethod
     def dependency_names(node) -> set[str]:
@@ -298,6 +306,33 @@ class _RepoIndex:
                                                  seen=seen | {qualified})
                 if dep:
                     return dep
+        return None
+
+    def annotation_dependency_module(self, module: str, node: ast.AST | None, seen=None) -> str | None:
+        """Module in which the `Depends(f)` target of an `Annotated[...]` alias is named.
+        The alias may live in another module than the endpoint that uses it, and `f`
+        must be resolved against the alias's imports, not the endpoint's."""
+        if node is None:
+            return None
+        seen = seen or set()
+        for sub in ast.walk(node):
+            if (isinstance(sub, ast.Call)
+                    and (_dotted(sub.func) or "").split(".")[-1] in {"Depends", "Security"}
+                    and sub.args):
+                return module
+        for sub in ast.walk(node):
+            dotted = _dotted(sub)
+            if not dotted:
+                continue
+            qualified = self.resolve_name(module, dotted)
+            if qualified in seen:
+                continue
+            alias = self.aliases.get(qualified)
+            if alias is not None:
+                found = self.annotation_dependency_module(
+                    qualified.rpartition(".")[0], alias, seen | {qualified})
+                if found:
+                    return found
         return None
 
     def annotation_type(self, module: str, node: ast.AST | None, seen=None) -> str | None:
@@ -548,10 +583,25 @@ class _FunctionAnalyzer:
         self.conditional_depth = 0
         self.returned_row = None
         self.returned_rows: list[dict | None] = []
-        self.dependency_params: list[tuple[str, str]] = []
+        self.dependency_params: list[tuple[str, str, str]] = []  # (param, dependency, module)
         self.return_states: list[_AnalysisState] = []
         self._try_throw_collectors: list[list[_AnalysisState]] = []
         self._next_effect_id = 0
+        # Totality ledger: ids of ast.Call / store-target nodes that were positively
+        # modeled.  Every other call in the body is classified by the final sweep.
+        self._visited: set[int] = set()
+        # Names that ever held an UNEXECUTED query object; handing one to an otherwise
+        # trusted first-order callable (or iterating it) may execute it.
+        self._query_names: set[str] = set()
+        # Names rebound from a nested function (nonlocal/global): never trackable.
+        self._untrackable: set[str] = {
+            name
+            for stmt in fn.body for outer in ast.walk(stmt)
+            if isinstance(outer, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+            for inner in ast.walk(outer)
+            if isinstance(inner, (ast.Nonlocal, ast.Global))
+            for name in inner.names
+        }
 
     # ---------- entry ----------
     def run(self) -> air.Endpoint:
@@ -561,14 +611,21 @@ class _FunctionAnalyzer:
 
     def _analyze_body(self):
         if self.analyze_dependencies:
-            for var, dep_name in self.dependency_params:
-                self._analyze_dependency(var, dep_name)
+            for var, dep_name, dep_module in self.dependency_params:
+                self._analyze_dependency(var, dep_name, dep_module)
+            if not self.helper_mode:
+                self._endpoint_decorators()
+                # `@router.get(..., dependencies=[Depends(f)])` runs f before the body.
+                for i, dep_name in enumerate(self._route_dependencies()):
+                    if not (self.index and self.index.is_principal_dependency(dep_name.split(".")[-1])):
+                        self._analyze_dependency(f"<route dependency {i}>", dep_name)
         falls_through = self._block(self.fn.body)
         terminal_states = list(self.return_states)
         if falls_through:
             terminal_states.append(self._snapshot())
         if terminal_states:
             self._restore(self._merge_states(terminal_states))
+        self._totality_sweep()
         self._finalize_returned_row()
         for var, r in self.rows.items():
             if not r.get("read_emitted"):
@@ -578,6 +635,164 @@ class _FunctionAnalyzer:
                 r["effect_id"] = getattr(effect, "_analysis_id", None)
                 r["read_emitted"] = True
         self._sync_row_effects()
+
+    def _endpoint_decorators(self):
+        """A decorator other than the route registration wraps the handler in code that
+        runs on every request and that we do not read."""
+        purity = self.index.purity if self.index else None
+        for dec in self.fn.decorator_list:
+            target = dec.func if isinstance(dec, ast.Call) else dec
+            is_route = (isinstance(dec, ast.Call) and isinstance(target, ast.Attribute)
+                        and target.attr in HTTP_METHODS | {"websocket", "api_route"})
+            if is_route:
+                continue
+            probe = ast.FunctionDef(name=self.fn.name, args=self.fn.args, body=[],
+                                    decorator_list=[dec], lineno=self.fn.lineno, col_offset=0)
+            if purity is not None and purity._decorators_ok(self.module, probe, self.owner_class):
+                continue
+            self._opaque(f"@{ast.unparse(target)[:80]}", "endpoint_decorator", self.fn.lineno)
+
+    def _route_dependencies(self) -> list[str]:
+        out = []
+        for dec in self.fn.decorator_list:
+            if not isinstance(dec, ast.Call):
+                continue
+            for kw in dec.keywords:
+                if kw.arg != "dependencies":
+                    continue
+                for sub in ast.walk(kw.value):
+                    if (isinstance(sub, ast.Call)
+                            and (_dotted(sub.func) or "").split(".")[-1] in ("Depends", "Security")):
+                        out.append((_dotted(sub.args[0]) if sub.args else None) or "?")
+        return out
+
+    # ---------- totality: nothing in the body may be silently skipped ----------
+    def _pctx(self):
+        return self.index.purity.ctx_for(self.module, self.fn, self.owner_class)
+
+    def _free(self, call) -> bool:
+        """True only if the purity oracle PROVES `call` cannot touch the database."""
+        if self.index is None:
+            return False
+        return self.index.purity.call_free(self._pctx(), call, frozenset(self._query_names))
+
+    def _opaque(self, call: str, reason: str, line: int, *, effects: bool = True, block: bool = True):
+        if not any(o.call == call and o.reason == reason and o.line == line for o in self.ep.opaque):
+            self.ep.opaque.append(air.Opaque(call, reason, line, block, effects))
+
+    def _kill(self, name: str):
+        """Forget everything tracked about a local that was rebound to something unknown."""
+        for table in (self.rows, self.creates, self.queries, self.query_results, self.values,
+                      self.var_types):
+            table.pop(name, None)
+        self.updated.discard(name)
+
+    @staticmethod
+    def _stored_names(node) -> set[str]:
+        """Names (re)bound anywhere inside `node`, including nested statements."""
+        names = set()
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, (ast.Store, ast.Del)):
+                names.add(sub.id)
+            elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(sub.name)
+            elif isinstance(sub, ast.ExceptHandler) and sub.name:
+                names.add(sub.name)
+            elif isinstance(sub, (ast.MatchAs, ast.MatchStar)) and sub.name:
+                names.add(sub.name)
+            elif isinstance(sub, ast.MatchMapping) and sub.rest:
+                names.add(sub.rest)
+            elif isinstance(sub, (ast.Import, ast.ImportFrom)):
+                names.update(a.asname or a.name.split(".")[0] for a in sub.names)
+        return names
+
+    _NARROWING_ONLY = {"filter", "where", "filter_by", "join", "outerjoin", "execution_options",
+                       "limit", "offset", "order_by", "options", "distinct"}
+
+    def _loop_narrowed_queries(self, loop) -> set[str]:
+        """Query variables a loop only ever rebinds as `q = q.<narrowing method>(...)`.
+        Such a rebinding keeps the model and can only shrink the selected rows, so the
+        loop-entry query still over-approximates every iteration; it need not be forgotten.
+        Any other kind of rebinding inside the loop disqualifies the name."""
+        def narrows(name, value):
+            node = value.value if isinstance(value, ast.Await) else value
+            if not isinstance(node, ast.Call):
+                return False
+            while isinstance(node, ast.Call):
+                if not (isinstance(node.func, ast.Attribute) and node.func.attr in self._NARROWING_ONLY):
+                    return False
+                node = node.func.value
+            return isinstance(node, ast.Name) and node.id == name
+
+        ok, bad = set(), set()
+        for sub in ast.walk(loop):
+            if isinstance(sub, (ast.Assign, ast.AnnAssign)) and sub.value is not None:
+                targets = sub.targets if isinstance(sub, ast.Assign) else [sub.target]
+                if len(targets) == 1 and isinstance(targets[0], ast.Name):
+                    name = targets[0].id
+                    (ok if name in self.queries and narrows(name, sub.value) else bad).add(name)
+                    continue
+                bad |= self._stored_names(sub)
+        simple = {id(t) for sub in ast.walk(loop) if isinstance(sub, (ast.Assign, ast.AnnAssign))
+                  for t in (sub.targets if isinstance(sub, ast.Assign) else [sub.target])
+                  if isinstance(t, ast.Name)}
+        for sub in ast.walk(loop):  # every other way of binding a name disqualifies it
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, (ast.Store, ast.Del)) and id(sub) not in simple:
+                bad.add(sub.id)
+            elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                bad.add(sub.name)
+        return ok - bad - self._untrackable
+
+    def _spine(self, e):
+        """The call nodes that make up a query expression `query()` understood."""
+        if isinstance(e, ast.Await):
+            e = e.value
+        if not isinstance(e, ast.Call):
+            return
+        yield e
+        f = e.func
+        if isinstance(f, ast.Attribute):
+            recv = _dotted(f.value)
+            if recv in self.db_vars:
+                if f.attr in ("execute", "scalars", "scalar", "exec") and e.args:
+                    yield from self._spine(e.args[0])
+                return
+            yield from self._spine(f.value)
+
+    def _mark_spine(self, e):
+        for node in self._spine(e):
+            self._visited.add(id(node))
+
+    def _totality_sweep(self):
+        """Soundness spine.  Every call in the function body (nested functions, lambdas
+        and comprehensions included) that was not positively modeled must be PROVEN
+        effect-free, otherwise it becomes an effect-capable opaque.  The same holds for
+        attribute/item writes that could be writes to an untracked ORM row."""
+        if self.index is None:
+            return
+        purity, ctx = self.index.purity, self._pctx()
+        tainted = frozenset(self._query_names)
+        for stmt in self.fn.body:
+            for node in ast.walk(stmt):
+                if id(node) in self._visited:
+                    continue
+                if isinstance(node, ast.Call):
+                    if self._session_lifecycle(node):
+                        continue
+                    if not purity.call_free(ctx, node, tainted):
+                        name = _dotted(node.func) or ast.unparse(node.func)[:80]
+                        self._opaque(f"{name}(...)", "unvisited_call", node.lineno)
+                elif (isinstance(node, (ast.Attribute, ast.Subscript))
+                        and isinstance(node.ctx, (ast.Store, ast.Del))):
+                    if not purity.store_free(ctx, node):
+                        self._opaque(f"{ast.unparse(node)[:80]} = ...", "untracked_write",
+                                     node.lineno, block=False)
+                elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+                    # iterating a legacy Query object executes it
+                    if any(isinstance(n, ast.Name) and n.id in tainted for n in ast.walk(node.iter)
+                           ) and not isinstance(node.iter, ast.Call):
+                        self._opaque(f"iterate {ast.unparse(node.iter)[:60]}", "unvisited_call",
+                                     getattr(node, "lineno", self.fn.lineno))
 
     def _snapshot(self) -> _AnalysisState:
         return _AnalysisState(
@@ -730,8 +945,11 @@ class _FunctionAnalyzer:
             if annotation_name in CONTAINER_TYPES:
                 self.var_types[arg.arg] = annotation_name
             dep = self._depends_target(default) or self._depends_target(arg.annotation)
+            dep_module = self.module
             if dep is None and self.index is not None:
                 dep = self.index.annotation_dependency(self.module, arg.annotation)
+                dep_module = self.index.annotation_dependency_module(
+                    self.module, arg.annotation) or self.module
             policy_dep = self.policy and dep in self.policy.principal_dependencies
             policy_type = self.policy and annotation_name in self.policy.principal_types
             superuser_dep = self.policy and dep in self.policy.superuser_dependencies
@@ -770,7 +988,7 @@ class _FunctionAnalyzer:
                     # A dependency that may load and authorize a resource (the dominant
                     # FastAPI idiom, e.g. `flow: Flow = Depends(get_flow)`). Analyze its
                     # body so its row read and ownership guards are modeled, not ignored.
-                    self.dependency_params.append((arg.arg, dep))
+                    self.dependency_params.append((arg.arg, dep, dep_module))
                 continue
             if policy_type or superuser_type:
                 self.principal = arg.arg
@@ -794,9 +1012,10 @@ class _FunctionAnalyzer:
         if node is None:
             return None
         for sub in ast.walk(node):
-            if (isinstance(sub, ast.Call) and (_dotted(sub.func) or "").split(".")[-1] in ("Depends", "Security")
-                    and sub.args):
-                return _dotted(sub.args[0]) or "?"
+            if isinstance(sub, ast.Call) and (_dotted(sub.func) or "").split(".")[-1] in ("Depends", "Security"):
+                # `Depends()` with no argument injects the annotated class: still code
+                # that runs before the handler, so it is a dependency we cannot name.
+                return (_dotted(sub.args[0]) if sub.args else None) or "?"
         return None
 
     # ---------- terms and predicates ----------
@@ -915,6 +1134,11 @@ class _FunctionAnalyzer:
             target = _dotted(e.args[0]) or ""
             model = target.split(".", 1)[0]
             if model not in self.models:
+                return None
+            # `select(A, B)` reads rows of both models; a query state describes one.
+            # Leave it unrecognised so it is reported as unmodeled rather than as A only.
+            entities = {(_dotted(arg) or "").split(".", 1)[0] for arg in e.args}
+            if len(entities & self.models) > 1:
                 return None
             terminal = f.id if f.id in ("delete", "update") else None
             return _QueryState(model, terminal=terminal)
@@ -1059,10 +1283,21 @@ class _FunctionAnalyzer:
         return True
 
     def _stmt(self, s):
+        # A walrus anywhere in this statement rebinds its target to an unmodeled value.
+        for sub in ast.walk(s):
+            if isinstance(sub, ast.NamedExpr) and isinstance(sub.target, ast.Name):
+                self._kill(sub.target.id)
         if isinstance(s, ast.If):
             return self._analyze_if(s)
         if isinstance(s, (ast.With, ast.AsyncWith, ast.For, ast.AsyncFor, ast.While)):
             if isinstance(s, (ast.For, ast.AsyncFor, ast.While)):
+                # The body is analyzed once, from the loop-entry state.  Anything the
+                # loop rebinds may hold a later iteration's value on entry, so forget it
+                # first (the loop target included).
+                narrowed = self._loop_narrowed_queries(s)
+                for name in self._stored_names(s):
+                    if name not in narrowed:
+                        self._kill(name)
                 base = self._snapshot()
                 self._restore(base)
                 self._block(s.body, conditional=True)
@@ -1070,9 +1305,16 @@ class _FunctionAnalyzer:
                 # Zero iterations is always possible; only facts common with the entry survive.
                 self._restore(self._merge_states([base, body]))
             else:
+                for item in s.items:
+                    if item.optional_vars is not None:
+                        for name in self._stored_names(item.optional_vars):
+                            self._kill(name)
                 return self._block(s.body)
             return True
         if isinstance(s, ast.Try):
+            for handler in s.handlers:
+                if handler.name:
+                    self._kill(handler.name)
             start = self._snapshot()
             throw_points: list[_AnalysisState] = []
             self._try_throw_collectors.append(throw_points)
@@ -1135,6 +1377,11 @@ class _FunctionAnalyzer:
             self.returned_rows.append(returned)
             self.return_states.append(self._snapshot())
             return False
+        # Any other statement (multi-target/augmented assignment, del, nested def,
+        # match, import, ...) is not modeled.  Its calls are classified by the totality
+        # sweep; here we only make sure no stale binding survives it.
+        for name in self._stored_names(s):
+            self._kill(name)
         return True
 
     def _guard(self, test):
@@ -1152,77 +1399,109 @@ class _FunctionAnalyzer:
         if isinstance(value, ast.Await):
             value = value.value
         if isinstance(target, ast.Name):
-            if isinstance(value, (ast.Dict, ast.List, ast.Set, ast.Tuple)):
-                self.var_types[target.id] = type(value).__name__.lower()
-                self.unresolved_values.pop(target.id, None)
-                return
-            q = self.query(value) if isinstance(value, (ast.Call, ast.Name)) else None
-            if q:
-                if not q.executed:
-                    self.queries[target.id] = q
-                    return
-                selector = air.and_(*q.conds)
-                effect = None
-                if not q.effect_emitted:
-                    effect = self._emit(
-                        q.terminal or "read", q.model, selector,
-                        list(self.global_guards), line,
-                    )
-                    q.effect_emitted = True
-                if q.terminal is None and self._returns_row(value):
-                    self.rows[target.id] = {
-                        "model": q.model, "selector": selector,
-                        "guards": list(self.global_guards), "line": line,
-                        "assumed_from": None, "read_emitted": True,
-                        "effect": effect,
-                        "effect_id": getattr(effect, "_analysis_id", None),
-                    }
-                elif q.terminal is None:
-                    self.query_results[target.id] = q
-                return
-            if isinstance(value, ast.Call) and _dotted(value.func) in self.models:
-                for kw in value.keywords:
-                    self._mark_unresolved_uses(kw.value, "database_mutation")
-                    self._mark_unresolved_calls(kw.value, "database mutation")
-                fields = [air.eq(air.fld(kw.arg), t) for kw in value.keywords
-                          if kw.arg and (t := self.term(kw.value)) is not None]
-                self.creates[target.id] = {"model": _dotted(value.func), "fields": fields, "line": line}
-                return
-            if isinstance(value, ast.Call):
-                constructor = (_dotted(value.func) or "").split(".")[-1]
-                if constructor in CONTAINER_TYPES:
-                    # A container wrapper such as `list(await session.exec(select(X)))`
-                    # still performs the inner query; extract its effects before binding
-                    # the variable as an opaque container.
-                    for inner in [*value.args, *(kw.value for kw in value.keywords)]:
-                        if isinstance(inner, (ast.Call, ast.Await)):
-                            self._expr_effects(inner, line)
-                    self.var_types[target.id] = constructor
-                    self.unresolved_values.pop(target.id, None)
-                    return
-                if self.index is not None and constructor in self.index.classes:
-                    self.var_types[target.id] = constructor
-            value_term = self.term(value)
-            if value_term is not None:
-                self.values[target.id] = value_term
-                return
-            if isinstance(value, ast.Call):
-                before = (len(self.ep.effects), len(self.ep.opaque), len(self.rows))
-                self._helper(target.id, value, line)
-                after = (len(self.ep.effects), len(self.ep.opaque), len(self.rows))
-                if (before == after and not self._ignored_call(_dotted(value.func))
-                        and not self._known_value_call(value)):
-                    self.unresolved_values[target.id] = (
-                        f"{_dotted(value.func) or ast.unparse(value.func)}(...)", line
-                    )
+            name = target.id
+            tables = (self.rows, self.creates, self.queries, self.query_results, self.values)
+            before = [table.get(name) for table in tables]
+            self.var_types.pop(name, None)
+            self._assign_name(target, value, line)
+            # A binding the assignment did not replace is stale: the name now holds
+            # something else.  Never let the old row/query/value answer for it.
+            for table, old in zip(tables, before):
+                if old is not None and table.get(name) is old:
+                    table.pop(name)
+            if self.rows.get(name) is not before[0]:
+                self.updated.discard(name)
+            if name in self.queries:
+                self._query_names.add(name)
+            if name in self._untrackable:
+                self._kill(name)
             return
         if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
-            var = target.value.id
-            if var in self.creates:
-                t = self.term(value)
-                if t is not None:
-                    self.creates[var]["fields"].append(air.eq(air.fld(target.attr), t))
-            elif var in self.rows and var not in self.updated:
+            self._assign_attribute(target, value, line)
+            return
+        # Tuple/list unpacking, starred or subscript targets: the names are rebound to
+        # values we do not model.  The right-hand side is left to the totality sweep,
+        # which records an effect-capable opaque unless it is proven effect-free.
+        for stored in self._stored_names(target):
+            self._kill(stored)
+
+    def _assign_name(self, target, value, line):
+        if isinstance(value, (ast.Dict, ast.List, ast.Set, ast.Tuple)):
+            self.var_types[target.id] = type(value).__name__.lower()
+            self.unresolved_values.pop(target.id, None)
+            return
+        q = self.query(value) if isinstance(value, (ast.Call, ast.Name)) else None
+        if q:
+            self._mark_spine(value)
+            if not q.executed:
+                self.queries[target.id] = q
+                return
+            selector = air.and_(*q.conds)
+            effect = None
+            if not q.effect_emitted:
+                effect = self._emit(
+                    q.terminal or "read", q.model, selector,
+                    list(self.global_guards), line,
+                )
+                q.effect_emitted = True
+            if q.terminal is None and self._returns_row(value):
+                self.rows[target.id] = {
+                    "model": q.model, "selector": selector,
+                    "guards": list(self.global_guards), "line": line,
+                    "assumed_from": None, "read_emitted": True,
+                    "effect": effect,
+                    "effect_id": getattr(effect, "_analysis_id", None),
+                }
+            elif q.terminal is None:
+                self.query_results[target.id] = q
+            return
+        if isinstance(value, ast.Call) and _dotted(value.func) in self.models:
+            for kw in value.keywords:
+                self._mark_unresolved_uses(kw.value, "database_mutation")
+                self._mark_unresolved_calls(kw.value, "database mutation")
+            fields = [air.eq(air.fld(kw.arg), t) for kw in value.keywords
+                      if kw.arg and (t := self.term(kw.value)) is not None]
+            self.creates[target.id] = {"model": _dotted(value.func), "fields": fields, "line": line}
+            return
+        if isinstance(value, ast.Call):
+            constructor = (_dotted(value.func) or "").split(".")[-1]
+            if constructor in CONTAINER_TYPES:
+                # A container wrapper such as `list(await session.exec(select(X)))`
+                # still performs the inner query; extract its effects before binding
+                # the variable as an opaque container.
+                for inner in [*value.args, *(kw.value for kw in value.keywords)]:
+                    if isinstance(inner, (ast.Call, ast.Await)):
+                        self._expr_effects(inner, line)
+                self.var_types[target.id] = constructor
+                self.unresolved_values.pop(target.id, None)
+                return
+            if self.index is not None and constructor in self.index.classes:
+                self.var_types[target.id] = constructor
+        value_term = self.term(value)
+        if value_term is not None:
+            self.values[target.id] = value_term
+            return
+        if isinstance(value, ast.Call):
+            before = (len(self.ep.effects), len(self.ep.opaque), len(self.rows))
+            self._helper(target.id, value, line)
+            after = (len(self.ep.effects), len(self.ep.opaque), len(self.rows))
+            if (before == after and not self._ignored_call(_dotted(value.func))
+                    and not self._known_value_call(value)):
+                self.unresolved_values[target.id] = (
+                    f"{_dotted(value.func) or ast.unparse(value.func)}(...)", line
+                )
+        return
+
+    def _assign_attribute(self, target, value, line):
+        var = target.value.id
+        if var in self.creates:
+            self._visited.add(id(target))
+            t = self.term(value)
+            if t is not None:
+                self.creates[var]["fields"].append(air.eq(air.fld(target.attr), t))
+        elif var in self.rows:
+            self._visited.add(id(target))
+            if var not in self.updated:
                 self._mark_unresolved_uses(value, "database mutation")
                 self._mark_unresolved_calls(value, "database mutation")
                 r = self.rows[var]
@@ -1259,8 +1538,8 @@ class _FunctionAnalyzer:
     def _mark_unresolved_uses(self, node, use: str):
         for name in self._unresolved_names(node):
             call, line = self.unresolved_values[name]
-            if not any(o.call == call and o.line == line for o in self.ep.opaque):
-                self.ep.opaque.append(air.Opaque(call, f"unresolved_result_in_{use.replace(' ', '_')}", line))
+            # Value-only: the producing call was classified for effects where it ran.
+            self._opaque(call, f"unresolved_result_in_{use.replace(' ', '_')}", line, effects=False)
 
     def _known_value_call(self, call: ast.Call) -> bool:
         name = _dotted(call.func)
@@ -1306,28 +1585,11 @@ class _FunctionAnalyzer:
                 continue
             name = _dotted(call.func) or ast.unparse(call.func)
             display = f"{name}(...)"
-            if not any(item.call == display and item.line == call.lineno for item in self.ep.opaque):
-                self.ep.opaque.append(
-                    air.Opaque(display, f"unresolved_result_in_{use.replace(' ', '_')}", call.lineno)
-                )
-
-    def _call_relevant(self, call) -> bool:
-        names = {n.id for n in ast.walk(call) if isinstance(n, ast.Name)}
-        if names & (self.db_vars | set(self.rows) | set(self.creates) | set(self.queries) | set(self.query_results)):
-            return True
-        # Source-unavailable imported modules may hide their own connection.
-        # Keep calls with attacker-controlled arguments opaque (the demo's
-        # installed storage/export modules rely on this conservative fallback).
-        name = _dotted(call.func) or ""
-        base = name.split(".", 1)[0]
-        imported_module = bool(self.index and base in self.index.imports.get(self.module, {}))
-        if not imported_module:
-            return False
-        for value in [*call.args, *(kw.value for kw in call.keywords)]:
-            term = self.term(value)
-            if term and next(iter(term)) in {"param", "principal"}:
-                return True
-        return False
+            # Value-only: this records that the RESULT is unknown where it steers control
+            # flow / a selector / the response.  Whether the call itself can touch data
+            # is decided separately (it stays unvisited for the totality sweep).
+            self._opaque(display, f"unresolved_result_in_{use.replace(' ', '_')}", call.lineno,
+                         effects=False)
 
     def _trusted_helper(self, name: str | None, call) -> bool:
         if not self.policy or not name:
@@ -1352,9 +1614,13 @@ class _FunctionAnalyzer:
         return True
 
     @staticmethod
-    def _bound_arguments(fn, call) -> dict[str, ast.AST]:
-        params = [*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs]
-        bound = {param.arg: value for param, value in zip(params, call.args)}
+    def _bound_arguments(fn, call, skip_first: bool = False) -> dict[str, ast.AST]:
+        positional = [*fn.args.posonlyargs, *fn.args.args]
+        if skip_first:
+            positional = positional[1:]  # bound method: self/cls is not a call argument
+        params = [*positional, *fn.args.kwonlyargs]
+        bound = {param.arg: value for param, value in zip(params, call.args)
+                 if not isinstance(value, ast.Starred)}
         bound.update({kw.arg: kw.value for kw in call.keywords if kw.arg})
         return bound
 
@@ -1381,13 +1647,17 @@ class _FunctionAnalyzer:
             return air.member(value[0], subject, obj) if subject is not None and obj is not None else True
         return True
 
-    def _analyze_repo_helper(self, ref, var, call, line) -> bool:
+    def _analyze_repo_helper(self, ref, var, call, line, skip_first: bool = False) -> bool:
         qualified = ".".join(x for x in (ref.module, ref.owner_class, ref.node.name) if x)
         if self.depth >= 3 or qualified in self.call_stack:
-            self.ep.opaque.append(air.Opaque(f"{qualified}(...)", "recursion_or_depth_limit", line))
+            self._opaque(f"{qualified}(...)", "recursion_or_depth_limit", line)
             return True
 
-        bound = self._bound_arguments(ref.node, call)
+        bound = self._bound_arguments(ref.node, call, skip_first)
+        if any(isinstance(a, ast.Starred) for a in call.args) or any(k.arg is None for k in call.keywords):
+            # *args/**kwargs at the call site: positional binding is unknown, so helper
+            # parameters must not be instantiated from (possibly shifted) arguments.
+            bound = {}
         roles = []
         has_row_arg = False
         for name, actual in bound.items():
@@ -1400,7 +1670,7 @@ class _FunctionAnalyzer:
                 role = f"row:{self.rows[actual.id]['model']}"
                 has_row_arg = True
             roles.append((name, role))
-        cache_key = (qualified, tuple(sorted(roles)))
+        cache_key = (qualified, tuple(sorted(roles)), skip_first)
         analysis = None if has_row_arg else self.index.summary_cache.get(cache_key)
 
         if analysis is None:
@@ -1468,7 +1738,8 @@ class _FunctionAnalyzer:
             if child_id is not None:
                 effect_by_child_id[child_id] = copied
         for opaque in analysis.opaque:
-            self.ep.opaque.append(air.Opaque(opaque.call, opaque.reason, line, opaque.may_block))
+            self.ep.opaque.append(air.Opaque(opaque.call, opaque.reason, line, opaque.may_block,
+                                             opaque.may_have_effects))
         for check in analysis.unmodeled_checks:
             self.ep.unmodeled_checks.append(air.UnmodeledCheck(check.expression, line))
 
@@ -1497,7 +1768,7 @@ class _FunctionAnalyzer:
             self.rows[var] = row
         return bool(analysis.effects or analysis.opaque or analysis.returned_row or analysis.row_guards)
 
-    def _analyze_dependency(self, var, dep_name):
+    def _analyze_dependency(self, var, dep_name, dep_module=None):
         """Model a `Depends(get_x)` parameter: its body's row read and the ownership
         guards it enforces, mapped onto the endpoint variable `var`. If the dependency
         loads a resource we cannot see into, mark it opaque (UNKNOWN), never silent."""
@@ -1506,19 +1777,28 @@ class _FunctionAnalyzer:
         line = self.fn.lineno
         arg_type = self.var_types.get(var)
         typed_resource = bool(arg_type and arg_type in self.models)
-        ref = self.index.resolve_function(self.module, dep_name, self.var_types, self.owner_class)
+        if self.policy and dep_name.split(".")[-1] in self.policy.ignored_calls:
+            return  # explicitly declared data-irrelevant in the policy
+        # Exact import resolution only: a dependency must never be matched to a
+        # same-named method somewhere else in the repository.
+        ref = self.index.functions.get(self.index.resolve_name(dep_module or self.module, dep_name))
+        if ref is not None and ref.owner_class is not None:
+            ref = None
         if ref is None:
-            if typed_resource:
-                self.ep.opaque.append(
-                    air.Opaque(f"{dep_name}(...)", "dependency_source_unavailable", line)
-                )
+            # FastAPI runs this code before the handler.  If we cannot read it we
+            # cannot rule out object access, whatever the parameter is typed as.
+            self._opaque(f"{dep_name}(...)", "dependency_source_unavailable", line)
             return
         qualified = ".".join(x for x in (ref.module, ref.owner_class, ref.node.name) if x)
-        if self.depth >= 3 or qualified in self.call_stack:
-            self.ep.opaque.append(air.Opaque(f"{qualified}(...)", "recursion_or_depth_limit", line))
+        if not self.index.purity._decorators_ok(ref.module, ref.node, ref.owner_class):
+            self._opaque(f"{qualified}(...)", "decorated_helper", line)
             return
-        if not (typed_resource or self.index.function_may_touch_db(ref)):
-            return  # a service/settings dependency with no object access
+        if self.depth >= 3 or qualified in self.call_stack:
+            self._opaque(f"{qualified}(...)", "recursion_or_depth_limit", line)
+            return
+        if not typed_resource and self.index.purity.function_free(
+                ref.module, ref.node, ref.owner_class):
+            return  # proven unable to touch the database (e.g. a settings provider)
 
         child = _FunctionAnalyzer(
             ref.node, self.models, self.summaries, ref.file, "DEPENDENCY", qualified,
@@ -1545,7 +1825,8 @@ class _FunctionAnalyzer:
             if child_id is not None:
                 id_map[child_id] = copied
         for opaque in child.ep.opaque:
-            self.ep.opaque.append(air.Opaque(opaque.call, opaque.reason, line, opaque.may_block))
+            self.ep.opaque.append(air.Opaque(opaque.call, opaque.reason, line, opaque.may_block,
+                                             opaque.may_have_effects))
         for check in child.ep.unmodeled_checks:
             self.ep.unmodeled_checks.append(air.UnmodeledCheck(check.expression, line))
 
@@ -1562,14 +1843,44 @@ class _FunctionAnalyzer:
             row["effect_id"] = getattr(copied_read, "_analysis_id", None)
             self.rows[var] = row
 
+    def _strict_ref(self, call):
+        """The single repository definition `call` dispatches to, identified by import
+        resolution or receiver type (never by method name alone).  None when the callee
+        is unidentified or has overriding definitions."""
+        if self.index is None:
+            return None, False
+        purity = self.index.purity
+        targets = purity.dispatch_targets(self._pctx(), call)
+        if not targets or len(targets) != 1:
+            return None, False
+        module, node, owner = targets[0]
+        path = self.index.modules[module][0]
+        ref = _FunctionRef(module, node, str(path.relative_to(self.index.repo)), owner)
+        decorators = {_dotted(d) for d in node.decorator_list}
+        bound_method = bool(owner) and "staticmethod" not in decorators and (
+            "classmethod" in decorators or not purity.receiver_is_class_object(self._pctx(), call))
+        return ref, bound_method
+
+    def _session_lifecycle(self, call) -> bool:
+        f = call.func
+        return (isinstance(f, ast.Attribute) and _dotted(f.value) in self.db_vars
+                and f.attr in {"commit", "flush", "refresh", "rollback", "close", "begin",
+                               "begin_nested"})
+
     def _helper(self, var, call, line):
+        """Classify one call that is not a recognised query.  Every exit either models
+        the call, proves it effect-free, or records an effect-capable opaque."""
+        self._visited.add(id(call))
         name = _dotted(call.func)
-        display_name = name or ast.unparse(call.func)
+        display_name = name or ast.unparse(call.func)[:80]
         for value in [*call.args, *(kw.value for kw in call.keywords)]:
             if isinstance(value, (ast.Call, ast.Await)):
                 self._expr_effects(value, line)
-        if self._ignored_call(name):
-            return
+        if name and self.policy and (
+                name in self.policy.ignored_calls or name.split(".")[-1] in self.policy.ignored_calls):
+            return  # explicit, user-declared: data-irrelevant
+        if self._session_lifecycle(call):
+            return  # transaction control on the session itself: no row is selected
         if self._trusted_helper(name, call):
             return
         if name in self.summaries:
@@ -1582,7 +1893,7 @@ class _FunctionAnalyzer:
                 bound[kw.arg] = kw.value
             sel = instantiate(s.selector, lambda n: self.term(bound[n]) if n in bound else None)
             if sel is None:
-                self.ep.opaque.append(air.Opaque(f"{name}(...)", "unsupported_pattern", line))
+                self._opaque(f"{name}(...)", "unsupported_pattern", line)
                 return
             label = None if s.reviewed else name
             if s.kind == "read":
@@ -1602,22 +1913,30 @@ class _FunctionAnalyzer:
             node.id for node in ast.walk(call)
             if isinstance(node, ast.Name) and node.id in (self.queries | self.query_results)
         }
-        if contains_query or query_names:
-            self.ep.opaque.append(air.Opaque(f"{name or ast.unparse(call.func)}(...)", "dynamic_query_helper", line))
+        free = self._free(call)
+        if (contains_query or query_names) and not free:
+            self._opaque(f"{display_name}(...)", "dynamic_query_helper", line)
             return
-        ref = self.index.resolve_function(
-            self.module, name, self.var_types, self.owner_class
-        ) if self.index else None
+        ref, bound_method = self._strict_ref(call)
         row_arg = any(
             isinstance(n, ast.Name) and n.id in self.rows
             for value in [*call.args, *(kw.value for kw in call.keywords)]
             for n in ast.walk(value)
         )
-        if ref is not None and (row_arg or self.index.function_may_touch_db(ref)):
-            if self._analyze_repo_helper(ref, var, call, line):
+        if ref is not None and (row_arg or not free):
+            if not self.index.purity._decorators_ok(ref.module, ref.node, ref.owner_class):
+                # A wrapper we cannot read may add effects, swallow the helper's
+                # denials, or not run the body at all: do not model the body as if it
+                # were what the call does.
+                self._opaque(f"{display_name}(...)", "decorated_helper", line)
                 return
-        if self._call_relevant(call):
-            self.ep.opaque.append(air.Opaque(f"{display_name}(...)", "source_unavailable", line))
+            # Inline the identified helper.  The child analyzer is total itself, so
+            # whatever it could not model comes back as opaque.
+            self._analyze_repo_helper(ref, var, call, line, bound_method)
+            return
+        if free:
+            return  # proven unable to read or write a modeled table
+        self._opaque(f"{display_name}(...)", "source_unavailable", line)
 
     def _update_row(self, var, line):
         if var in self.rows and var not in self.updated:
@@ -1631,27 +1950,32 @@ class _FunctionAnalyzer:
         # path misses it and setattr is otherwise in IGNORED_CALLS.
         if (isinstance(f, ast.Name) and f.id == "setattr" and call.args
                 and isinstance(call.args[0], ast.Name) and call.args[0].id in self.rows):
+            self._visited.add(id(call))
             self._update_row(call.args[0].id, line)
             return
         if isinstance(f, ast.Attribute):
             recv = _dotted(f.value)
             # row.sqlmodel_update(...) writes new values into a tracked row in place.
             if f.attr == "sqlmodel_update" and recv in self.rows:
+                self._visited.add(id(call))
                 self._update_row(recv, line)
                 return
             if recv in self.db_vars and call.args:
                 arg = call.args[0]
                 var = arg.id if isinstance(arg, ast.Name) else None
                 if f.attr == "delete" and var in self.rows:
+                    self._visited.add(id(call))
                     r = self.rows[var]
                     self._emit("delete", r["model"], r["selector"], list(r["guards"]), line, r["assumed_from"])
                     return
                 if f.attr in ("add", "merge") and var in self.creates:
+                    self._visited.add(id(call))
                     c = self.creates.pop(var)
                     self._emit("create", c["model"], air.and_(*c["fields"]), list(self.global_guards), line)
                     return
                 if f.attr in ("add", "merge") and var in self.rows:
                     # Re-persisting an already-loaded row is a conservative update.
+                    self._visited.add(id(call))
                     self._update_row(var, line)
                     return
         self._expr_effects(call, line)
@@ -1662,6 +1986,10 @@ class _FunctionAnalyzer:
         if isinstance(e, ast.Call):
             q = self.query(e)
             if q:
+                if q.executed:
+                    # Only an EXECUTED query is accounted for.  A statement that is
+                    # merely built here stays unvisited and is caught by the sweep.
+                    self._mark_spine(e)
                 if q.executed and not q.effect_emitted:
                     self._emit(q.terminal or "read", q.model, air.and_(*q.conds),
                                list(self.global_guards), line)

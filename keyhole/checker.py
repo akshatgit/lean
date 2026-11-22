@@ -109,17 +109,21 @@ def check_endpoints(endpoints: list, policy: Policy) -> list:
 
 
 def _aggregate(res: EndpointResult, ep: Endpoint) -> str:
-    # No modeled object access at all. If the adapter also recorded an opaque
-    # operation, it *failed* to model something -> UNKNOWN. Otherwise there is
+    # Only opacity that may hide a read/write makes the extracted effects incomplete.
+    # Opacity that can merely hide a guard (may_block only) never blocks SAFE: losing
+    # a guard widens the modeled row set, so a proof over it still covers the code.
+    incomplete = any(o.may_have_effects for o in ep.opaque)
+    # No modeled object access at all. If something effect-capable was left
+    # unmodeled the adapter *failed* to model it -> UNKNOWN. Otherwise there is
     # genuinely nothing to check, but that is still not a proof of safety, so it
     # is reported as its own `no_effects` state and never counted as SAFE.
     if not res.effects:
-        return "unknown" if ep.opaque else "no_effects"
+        return "unknown" if incomplete else "no_effects"
     worst = "safe"
     for er in res.effects:
         if RANK[er.verdict] > RANK[worst]:
             worst = er.verdict
-    if ep.opaque and RANK[worst] < RANK["unknown"]:
+    if incomplete and RANK[worst] < RANK["unknown"]:
         worst = "unknown"
     if worst == "safe" and res.assumptions:
         worst = "safe_assumed"

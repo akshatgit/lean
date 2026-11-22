@@ -25,10 +25,17 @@ def _review_reasons(res) -> list[str]:
     reasons = []
     if res.assumptions:
         reasons.append("The result depends on an unconfirmed policy or helper summary.")
-    if res.endpoint.opaque:
+    effect_opaque = [o for o in res.endpoint.opaque if o.may_have_effects]
+    guard_opaque = [o for o in res.endpoint.opaque if not o.may_have_effects]
+    if effect_opaque:
         reasons.append(
-            f"{len(res.endpoint.opaque)} source operation(s) were not modeled; "
-            "authorization in those operations is outside the proof."
+            f"{len(effect_opaque)} source operation(s) that may read or write data were not "
+            "modeled; the extracted effects may be incomplete."
+        )
+    if guard_opaque:
+        reasons.append(
+            f"{len(guard_opaque)} value-only operation(s) were not modeled; they cannot touch "
+            "data but may hide a check, so a counterexample past them is only a lead."
         )
     if res.endpoint.unmodeled_checks:
         reasons.append(
@@ -134,7 +141,8 @@ def text_report(results, policy, verbose: bool = False) -> str:
             elif verbose:
                 out.append(f"    {er.effect.kind} {er.effect.resource}: {er.verdict}")
         for o in ep.opaque:
-            out.append(f"    opaque: {o.call} ({o.reason}, line {o.line})")
+            kind = "opaque" if o.may_have_effects else "opaque (value only)"
+            out.append(f"    {kind}: {o.call} ({o.reason}, line {o.line})")
         for a in res.assumptions:
             out.append(f"    assumes: {a}")
     summary = ", ".join(f"{counts.get(k, 0)} {LABEL[k]}" for k in LABEL)
@@ -400,7 +408,8 @@ def _html_finding(res, policy) -> str:
     opaque_html = ""
     if ep.opaque:
         opaque_items = "".join(
-            f"<li><code>{_h(o.call)}</code> — {_h(o.reason)}, line {o.line}</li>" for o in ep.opaque
+            f"<li><code>{_h(o.call)}</code> — {_h(o.reason)}, line {o.line}"
+            f"{'' if o.may_have_effects else ' (value only: cannot touch data)'}</li>" for o in ep.opaque
         )
         opaque_html = f"<h3>Unmodeled operations</h3><ul class=\"compact\">{opaque_items}</ul>"
 
@@ -449,9 +458,9 @@ def html_report(results, policy, title: str = "Keyhole security report") -> str:
     )
     raw_counts = {key: sum(r.verdict == key for r in results) for key in LABEL}
     no_effects = sum(not r.endpoint.effects for r in results)
-    incomplete = sum(bool(r.endpoint.opaque) for r in results)
+    incomplete = sum(any(o.may_have_effects for o in r.endpoint.opaque) for r in results)
     proof_complete = sum(
-        bool(r.endpoint.effects) and not r.endpoint.opaque and not r.assumptions for r in results
+        bool(r.endpoint.effects) and r.verdict == "safe" for r in results
     )
     resources = sorted({er.effect.resource for r in results for er in r.effects})
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -573,6 +582,8 @@ def stats_report(results) -> str:
         if res.verdict != "unknown":
             continue
         for opaque in res.endpoint.opaque:
+            if not opaque.may_have_effects:
+                continue  # value-only opacity is not why the endpoint is UNKNOWN
             call = opaque.call.split("(", 1)[0].strip() or "<unknown>"
             by_reason[opaque.reason] = by_reason.get(opaque.reason, 0) + 1
             by_call[call] = by_call.get(call, 0) + 1
