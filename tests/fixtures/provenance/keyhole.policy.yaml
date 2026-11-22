@@ -1,0 +1,15 @@
+# Confirmed policy: every amber verdict in this fixture comes from an adapter-side assumption.
+principal:
+  id: current_user.id
+helpers:
+  ensure_document_access: owner(owner_id)
+adapter:
+  ignore_calls:
+    - emit            # vendor.emit(...)        - unreadable
+    - record          # audit_sink.record(...)  - unreadable
+    - lookup          # vendor.lookup(...)      - unreadable
+    - get_vendor_client
+resources:
+  Doc:
+    confirmed: true
+    read: owner(owner_id)

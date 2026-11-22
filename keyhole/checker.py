@@ -16,7 +16,7 @@ from pathlib import Path
 from .air import Endpoint
 from .policy import Policy
 
-RANK = {"no_effects": 0, "safe": 0, "safe_assumed": 1, "unknown": 2,
+RANK = {"no_effects": 0, "safe": 0, "no_effects_assumed": 1, "safe_assumed": 1, "unknown": 2,
         "possible_violation": 3, "violation": 4}
 
 
@@ -47,7 +47,11 @@ class EffectResult:
 class EndpointResult:
     endpoint: Endpoint
     effects: list = field(default_factory=list)
-    assumptions: list = field(default_factory=list)   # e.g. LLM summaries, inferred policy
+    assumptions: list = field(default_factory=list)   # human-readable, one per provenance id
+    # Assumption provenance set: id -> reason.  The union of everything the adapter
+    # assumed while extracting this endpoint and every unconfirmed policy it was checked
+    # against.  A clean green verdict requires this to be empty.
+    provenance: dict = field(default_factory=dict)
     verdict: str = "safe"
 
 
@@ -73,6 +77,21 @@ def check_endpoints(endpoints: list, policy: Policy) -> list:
     results = []
     for i, ep in enumerate(endpoints):
         res = EndpointResult(ep)
+        res.provenance = dict(ep.assumptions)
+        for e in ep.effects:
+            if e.assumed_from and not ep.assumptions:
+                # Defensive: an effect labelled by a path that recorded no id.
+                res.provenance[f"assumed:{e.assumed_from}"] = (
+                    f"trusted helper/summary for {e.assumed_from} (not reviewed)")
+            if not policy.is_confirmed(e.resource):
+                res.provenance[f"policy-unconfirmed:{e.resource}"] = (
+                    f"policy for {e.resource} is inferred, not confirmed")
+        # Assumptions that SUPPRESSED code (a call declared irrelevant) may have removed
+        # a denial, so a counterexample past them is only a lead.  Assumptions that add
+        # a guard or an identity fact can only make a counterexample harder to find; a
+        # violation that survives them needs no demotion.
+        suppressions = sorted(key for key in res.provenance
+                              if key.startswith(("ignore:", "declared-free:")))
         for j, e in enumerate(ep.effects):
             r = verdicts[f"{i}:{j}"]
             verdict = r["verdict"]
@@ -92,6 +111,9 @@ def check_endpoints(endpoints: list, policy: Policy) -> list:
                 # policy demotes the counterexample to a lead, never a finding.
                 if not policy.is_confirmed(e.resource):
                     blockers.append(f"policy for {e.resource} is not confirmed")
+                # Likewise a counterexample over a model from which a call was removed
+                # by declaration is a lead, not a finding.
+                blockers.extend(f"rests on assumption {key}" for key in suppressions)
                 blockers = sorted(set(blockers))
                 if blockers:
                     verdict = "possible_violation"
@@ -100,9 +122,7 @@ def check_endpoints(endpoints: list, policy: Policy) -> list:
             ))
             if e.assumed_from:
                 res.assumptions.append(f"trusted helper/summary for {e.assumed_from} (not reviewed)")
-            if not policy.is_confirmed(e.resource):
-                res.assumptions.append(f"policy for {e.resource} is inferred, not confirmed")
-        res.assumptions = sorted(set(res.assumptions))
+        res.assumptions = sorted(set(res.assumptions) | set(res.provenance.values()))
         res.verdict = _aggregate(res, ep)
         results.append(res)
     return results
@@ -117,14 +137,18 @@ def _aggregate(res: EndpointResult, ep: Endpoint) -> str:
     # unmodeled the adapter *failed* to model it -> UNKNOWN. Otherwise there is
     # genuinely nothing to check, but that is still not a proof of safety, so it
     # is reported as its own `no_effects` state and never counted as SAFE.
+    # The provenance set gates every green verdict, effects or not: "nothing to check"
+    # that holds only because a call was declared irrelevant is not a clean result.
     if not res.effects:
-        return "unknown" if incomplete else "no_effects"
+        if incomplete:
+            return "unknown"
+        return "no_effects_assumed" if res.provenance else "no_effects"
     worst = "safe"
     for er in res.effects:
         if RANK[er.verdict] > RANK[worst]:
             worst = er.verdict
     if incomplete and RANK[worst] < RANK["unknown"]:
         worst = "unknown"
-    if worst == "safe" and res.assumptions:
+    if worst == "safe" and (res.provenance or res.assumptions):
         worst = "safe_assumed"
     return worst

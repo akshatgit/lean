@@ -481,6 +481,7 @@ class _HelperAnalysis:
     unmodeled_checks: list
     returned_row: dict | None
     row_guards: dict[str, list] = field(default_factory=dict)
+    assumptions: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -731,7 +732,20 @@ class _FunctionAnalyzer:
         """True only if the purity oracle PROVES `call` cannot touch the database."""
         if self.index is None:
             return False
-        return self.index.purity.call_free(self._pctx(), call, frozenset(self._query_names))
+        ok, deps = self.index.purity.call_free_deps(self._pctx(), call, frozenset(self._query_names))
+        self._assume_declared(deps)
+        return ok
+
+    def _assume(self, key: str, reason: str):
+        """Record that this endpoint's model rests on an unproven claim.  The set only
+        grows: nothing downstream may clear or overwrite an entry."""
+        self.ep.assumptions.setdefault(key, reason)
+
+    def _assume_declared(self, deps):
+        for key in deps:
+            name = key.split(":", 1)[1]
+            self._assume(key, f"call {name} is declared data-irrelevant in the policy "
+                              f"(adapter.ignore_calls); a call was treated as effect-free on that basis")
 
     def _opaque(self, call: str, reason: str, line: int, *, effects: bool = True, block: bool = True):
         if not any(o.call == call and o.reason == reason and o.line == line for o in self.ep.opaque):
@@ -843,9 +857,11 @@ class _FunctionAnalyzer:
                 if isinstance(node, ast.Call):
                     if self._session_lifecycle(node):
                         continue
-                    if not purity.call_free(ctx, node, tainted):
+                    free, deps = purity.call_free_deps(ctx, node, tainted)
+                    if not free:
                         name = _dotted(node.func) or ast.unparse(node.func)[:80]
                         self._opaque(f"{name}(...)", "unvisited_call", node.lineno)
+                    self._assume_declared(deps)
                 elif (isinstance(node, (ast.Attribute, ast.Subscript))
                         and isinstance(node.ctx, (ast.Store, ast.Del))):
                     if not purity.store_free(ctx, node):
@@ -1056,6 +1072,8 @@ class _FunctionAnalyzer:
                     if superuser_dep:
                         self.global_guards.append(air.eq(air.principal("is_superuser"), air.const(True)))
                         self.global_assumed_from = f"principal dependency {dep}"
+                        self._assume(f"superuser:{dep}",
+                                     f"dependency {dep} is declared to admit superusers only (policy)")
                     if not (policy_dep or superuser_dep):
                         # Chosen by NAME only, not declared in the policy.  The name is
                         # not evidence of what the body does: verify it before the body
@@ -1076,6 +1094,8 @@ class _FunctionAnalyzer:
                 if superuser_type:
                     self.global_guards.append(air.eq(air.principal("is_superuser"), air.const(True)))
                     self.global_assumed_from = f"principal type {annotation_name}"
+                    self._assume(f"superuser:{annotation_name}",
+                                 f"type {annotation_name} is declared to admit superusers only (policy)")
                 continue
             tname = _dotted(arg.annotation) if arg.annotation is not None else None
             short = tname.split(".")[-1] if tname else None
@@ -1713,6 +1733,8 @@ class _FunctionAnalyzer:
         key = name if name in self.policy.helper_guards else short
         if key not in self.policy.helper_guards:
             return False
+        self._assume(f"helper-guard:{key}",
+                     f"helper {key} is declared in the policy to enforce a guard (not verified against its body)")
         refs = {n.id for n in ast.walk(call) if isinstance(n, ast.Name) and n.id in self.rows}
         if not refs:
             # User-declared trust (policy `helpers:`), unchanged: with no row argument the
@@ -1843,7 +1865,7 @@ class _FunctionAnalyzer:
             analysis = _HelperAnalysis(
                 copy.deepcopy(child.ep.effects), copy.deepcopy(child.ep.opaque),
                 copy.deepcopy(child.ep.unmodeled_checks), copy.deepcopy(child.returned_row),
-                copy.deepcopy(row_guards),
+                copy.deepcopy(row_guards), dict(child.ep.assumptions),
             )
             self.index.summary_cache[cache_key] = copy.deepcopy(analysis)
 
@@ -1870,6 +1892,8 @@ class _FunctionAnalyzer:
                                              opaque.may_have_effects))
         for check in analysis.unmodeled_checks:
             self.ep.unmodeled_checks.append(air.UnmodeledCheck(check.expression, line))
+        for key, reason in analysis.assumptions.items():
+            self._assume(key, reason)  # whatever the helper's model assumed, the caller assumes
 
         for param_name, guards in analysis.row_guards.items():
             actual = bound.get(param_name)
@@ -1917,6 +1941,9 @@ class _FunctionAnalyzer:
         arg_type = self.var_types.get(var)
         typed_resource = bool(arg_type and arg_type in self.models)
         if self.policy and dep_name.split(".")[-1] in self.policy.ignored_calls:
+            short = dep_name.split(".")[-1]
+            self._assume(f"ignore:{short}", f"dependency {short} is declared data-irrelevant in the "
+                                            f"policy (adapter.ignore_calls); its body was not analyzed")
             return  # explicitly declared data-irrelevant in the policy
         # Exact import resolution only: a dependency must never be matched to a
         # same-named method somewhere else in the repository.
@@ -1945,9 +1972,11 @@ class _FunctionAnalyzer:
             self._depends_target(node) is not None
             or self.index.annotation_dependency(ref.module, node) is not None
             for node in [*dep_defaults, *(a.annotation for a in dep_args)] if node is not None)
-        if ((as_principal or not typed_resource) and not has_subdependencies
-                and self.index.purity.function_free(ref.module, ref.node, ref.owner_class)):
-            return  # proven unable to touch the database (e.g. a settings provider)
+        if (as_principal or not typed_resource) and not has_subdependencies:
+            free, deps = self.index.purity.function_free_deps(ref.module, ref.node, ref.owner_class)
+            if free:
+                self._assume_declared(deps)
+                return  # unable to touch the database (given `deps`, if any)
 
         child = _FunctionAnalyzer(
             ref.node, self.models, self.summaries, ref.file, "DEPENDENCY", qualified,
@@ -1992,6 +2021,8 @@ class _FunctionAnalyzer:
                                              opaque.may_have_effects))
         for check in child.ep.unmodeled_checks:
             self.ep.unmodeled_checks.append(air.UnmodeledCheck(check.expression, line))
+        for key, reason in child.ep.assumptions.items():
+            self._assume(key, reason)
 
         if as_principal and not bind_row:
             self._principal_effect_ids.update(e._analysis_id for e in id_map.values())
@@ -2007,6 +2038,9 @@ class _FunctionAnalyzer:
                 own_read.guards.append(air.eq(air.fld(id_attr), air.principal(id_attr)))
                 own_read.assumed_from = (
                     f"principal dependency {dep_name} (matched by name; assumed to return the caller)")
+                self._assume(f"principal-identity:{dep_name}",
+                             f"principal dependency {dep_name} was matched by name and is assumed to "
+                             f"return the caller (its returned row is taken to be the principal)")
             return
         if returned is not None:
             # Bind the returned row to ITS OWN read effect (via the child effect id),
@@ -2070,7 +2104,10 @@ class _FunctionAnalyzer:
                 self._expr_effects(value, line)
         if name and self.policy and (
                 name in self.policy.ignored_calls or name.split(".")[-1] in self.policy.ignored_calls):
-            return  # explicit, user-declared: data-irrelevant
+            declared = name if name in self.policy.ignored_calls else name.split(".")[-1]
+            self._assume(f"ignore:{declared}", f"call {declared} is declared data-irrelevant in the "
+                                               f"policy (adapter.ignore_calls); it was not analyzed")
+            return  # explicit, user-declared: data-irrelevant, and recorded as an assumption
         if self._session_lifecycle(call):
             return  # transaction control on the session itself: no row is selected
         if self._trusted_helper(name, call):
@@ -2090,6 +2127,9 @@ class _FunctionAnalyzer:
                 self._opaque(f"{name}(...)", "unsupported_pattern", line)
                 return
             label = None if s.reviewed else name
+            if not s.reviewed:
+                self._assume(f"summary:{name}",
+                             f"helper {name} is modeled by a committed summary that has not been reviewed")
             if s.kind == "read":
                 self.rows[var] = {"model": s.resource, "selector": sel,
                                   "guards": list(self.global_guards), "line": line,

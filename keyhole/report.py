@@ -12,6 +12,7 @@ LABEL = {
     "safe": "SAFE",
     "safe_assumed": "SAFE (assumed)",
     "no_effects": "NO EFFECTS",
+    "no_effects_assumed": "NO EFFECTS (assumed)",
     "possible_violation": "POSSIBLE VIOLATION",
     "violation": "VIOLATION",
     "unknown": "UNKNOWN",
@@ -63,6 +64,7 @@ def _display_status(res) -> tuple[str, str]:
         "unknown": "Unknown",
         "safe_assumed": "Safe (assumed)",
         "no_effects": "No modeled effects",
+        "no_effects_assumed": "No modeled effects (assumed)",
         "safe": "Verified safe",
     }
     return labels[res.verdict], res.verdict
@@ -83,6 +85,10 @@ def _status_explanation(res) -> str:
         ),
         "Safe (assumed)": (
             "Lean proved the extracted effect follows the supplied policy, but that policy or a helper summary has not been confirmed."
+        ),
+        "No modeled effects (assumed)": (
+            "The adapter found no object read or write to check, but only because one or more calls were "
+            "declared irrelevant or otherwise assumed. Nothing here is verified until those assumptions are reviewed."
         ),
         "No modeled effects": (
             "The adapter found no object read or write to check. This may be expected for health checks and redirects, "
@@ -143,8 +149,8 @@ def text_report(results, policy, verbose: bool = False) -> str:
         for o in ep.opaque:
             kind = "opaque" if o.may_have_effects else "opaque (value only)"
             out.append(f"    {kind}: {o.call} ({o.reason}, line {o.line})")
-        for a in res.assumptions:
-            out.append(f"    assumes: {a}")
+        for key in sorted(res.provenance):
+            out.append(f"    assumes [{key}]: {res.provenance[key]}")
     summary = ", ".join(f"{counts.get(k, 0)} {LABEL[k]}" for k in LABEL)
     out.append("")
     out.append(f"{len(results)} endpoints: {summary}")
@@ -162,6 +168,8 @@ def json_report(results) -> str:
                          "blocking_calls": er.blocking_calls}
                         for er in res.effects],
             "assumptions": res.assumptions,
+            "provenance": [{"id": key, "reason": res.provenance[key]}
+                           for key in sorted(res.provenance)],
         })
     return json.dumps(data, indent=2)
 
@@ -267,6 +275,7 @@ _HTML_STYLE = """
   .finding.safe { border-left-color: var(--safe); }
   .finding.safe_assumed { border-left-color: var(--assumed); }
   .finding.no_effects { border-left-color: var(--neutral); }
+  .finding.no_effects_assumed { border-left-color: var(--assumed); }
   .finding summary {
     display: grid;
     grid-template-columns: minmax(125px, 175px) 1fr auto;
@@ -416,7 +425,8 @@ def _html_finding(res, policy) -> str:
     assumptions_html = ""
     if res.assumptions:
         assumptions_html = "<h3>Assumptions</h3>" + "".join(
-            f'<span class="pill">{_h(a)}</span>' for a in res.assumptions
+            f'<span class="pill">{_h(res.provenance[key])} [{_h(key)}]</span>'
+            for key in sorted(res.provenance)
         )
 
     checks_html = ""
@@ -451,7 +461,7 @@ def html_report(results, policy, title: str = "Keyhole security report") -> str:
         results,
         key=lambda r: (
             {"violation": 0, "possible_violation": 1, "unknown": 2,
-             "safe_assumed": 3, "safe": 4, "no_effects": 5}[r.verdict],
+             "safe_assumed": 3, "no_effects_assumed": 3, "safe": 4, "no_effects": 5}[r.verdict],
             r.endpoint.file,
             r.endpoint.line,
         ),
@@ -527,6 +537,7 @@ def html_report(results, policy, title: str = "Keyhole security report") -> str:
         '<option value="violation">VIOLATION (modeled)</option>'
         '<option value="possible_violation">Possible violations</option><option value="unknown">Unknown</option>'
         '<option value="safe_assumed">Safe (assumed)</option><option value="safe">Verified safe</option>'
+        '<option value="no_effects_assumed">No modeled effects (assumed)</option>'
         '<option value="no_effects">No modeled effects</option></select>'
         f'<select id="filter-resource"><option value="">All resources</option>{resource_options}</select>'
         '<select id="filter-review"><option value="">All review states</option>'

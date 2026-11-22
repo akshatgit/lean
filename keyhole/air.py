@@ -160,6 +160,11 @@ class Endpoint:
     effects: list = field(default_factory=list)
     opaque: list = field(default_factory=list)
     unmodeled_checks: list = field(default_factory=list)
+    # Assumption provenance: id -> human-readable reason for EVERY unproven claim this
+    # endpoint's model rests on (a suppressed call, a declared guard, an unreviewed
+    # summary, an identity fact, ...).  It is a set and only ever grows; a verdict may be
+    # clean green only if it is empty.
+    assumptions: dict = field(default_factory=dict)
 
     @property
     def key(self) -> str:
@@ -175,4 +180,6 @@ class Endpoint:
             "effects": [e.to_json() for e in self.effects],
             "opaque": [o.to_json() for o in self.opaque],
             "unmodeled_checks": [c.to_json() for c in self.unmodeled_checks],
+            "assumptions": [{"id": key, "reason": self.assumptions[key]}
+                            for key in sorted(self.assumptions)],
         }

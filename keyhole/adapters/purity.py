@@ -361,11 +361,17 @@ class Purity:
         self.toplevel_funcs: dict[str, tuple[str, ast.AST]] = {}
         self._ctx_cache: dict[int, _Ctx] = {}
         self._module_ctx: dict[str, _Ctx] = {}
-        self._free_cache: dict[int, bool] = {}
+        # Every memoised "effect-free" verdict is stored WITH the declarations it rests
+        # on: (free, frozenset of assumption ids).  A bare cached True would let a
+        # user-declared irrelevance become an unlabelled "proof" for every caller.
+        self._free_cache: dict[int, tuple[bool, frozenset]] = {}
         self._stack: list[int] = []
         self._tentative: set[int] = set()
-        self._ctor_cache: dict[str, bool] = {}
+        self._ctor_cache: dict[str, tuple[bool, frozenset]] = {}
         self._ctor_stack: set[str] = set()
+        # Collector stack: the innermost set receives the id of every declaration used
+        # while establishing the verdict currently being computed.
+        self._deps: list[set] = []
         # `if TYPE_CHECKING:` imports: they name types used in annotations.  The names are
         # unbound at runtime, so they can only ever inform annotation types (A1).
         self.type_imports: dict[str, dict[str, str]] = {}
@@ -645,26 +651,55 @@ class Purity:
         return any(self._methods(cls, hook) for cls in classes
                    for hook in ("__getattr__", "__getattribute__", "__call__"))
 
+    # ---------------------------------------------------------------- provenance
+    def _note(self, deps):
+        """Record that the verdict being computed depends on these declarations."""
+        if self._deps and deps:
+            self._deps[-1].update(deps)
+
+    def _scoped(self, compute):
+        """Run `compute()` with a fresh collector; return (ok, ids it depended on) and
+        pass the ids on to the enclosing computation."""
+        self._deps.append(set())
+        try:
+            ok = compute()
+        finally:
+            deps = frozenset(self._deps.pop())
+        if ok:
+            self._note(deps)
+        return ok, (deps if ok else frozenset())
+
+    def call_free_deps(self, ctx: "_Ctx", call: ast.Call, tainted: frozenset = frozenset()):
+        """(free, ids): `ids` is empty only when the call is PROVEN effect-free.  A
+        non-empty set means "free, provided these declarations are true"."""
+        return self._scoped(lambda: self.call_free(ctx, call, tainted))
+
+    def function_free_deps(self, module: str, fn, owner_class: str | None = None):
+        return self._scoped(lambda: self.function_free(module, fn, owner_class))
+
     def class_ctor_free(self, q: str) -> bool:
         """Constructing an instance of q (or validating into it) runs no DB code."""
         if q in self._ctor_cache:
-            return self._ctor_cache[q]
+            ok, deps = self._ctor_cache[q]
+            self._note(deps)
+            return ok
         if q in self._ctor_stack:
             return True
         self._ctor_stack.add(q)
         try:
-            ok = self._class_ctor_free(q)
+            ok, deps = self._scoped(lambda: self._class_ctor_free(q))
         finally:
             self._ctor_stack.discard(q)
         root = not self._stack and not self._ctor_stack
         if root:
-            self._ctor_cache[q] = ok
+            self._ctor_cache[q] = (ok, deps)
             if ok:
+                # members of a cycle share the root's (superset) provenance
                 for item in self._tentative:
-                    self._free_cache[item] = True
+                    self._free_cache[item] = (True, deps)
             self._tentative = set()
         elif not ok:
-            self._ctor_cache[q] = False
+            self._ctor_cache[q] = (False, frozenset())
         return ok
 
     def _class_ctor_free(self, q: str) -> bool:
@@ -1134,21 +1169,27 @@ class Purity:
         """True only if no call reachable from fn's body can touch the database."""
         key = id(fn)
         if key in self._free_cache:
-            return self._free_cache[key]
+            ok, deps = self._free_cache[key]
+            self._note(deps)
+            return ok
         if key in self._stack or key in self._tentative:
-            return True  # coinductive assumption; only cached once the root succeeds
+            # Coinductive assumption; only cached once the root succeeds.  Whatever this
+            # node depended on was already passed up to the root's collector when it
+            # was first computed, and the root's set is what every cycle member is
+            # cached with.
+            return True
         self._stack.append(key)
         try:
-            ok = self._body_free(module, fn, owner_class)
+            ok, deps = self._scoped(lambda: self._body_free(module, fn, owner_class))
         finally:
             self._stack.pop()
         root = not self._stack and not self._ctor_stack
         if not ok:
-            self._free_cache[key] = False
+            self._free_cache[key] = (False, frozenset())
         elif root:
-            self._free_cache[key] = True
+            self._free_cache[key] = (True, deps)
             for item in self._tentative:
-                self._free_cache[item] = True
+                self._free_cache[item] = (True, deps)
         else:
             self._tentative.add(key)
         if root:
@@ -1242,7 +1283,11 @@ class Purity:
         func = self._callee(ctx, call)
         name = dotted(func)
         if name and (name in self.declared_free or name.split(".")[-1] in self.declared_free):
-            return True, False  # explicit user declaration (policy adapter.ignore_calls)
+            # Explicit user declaration (policy adapter.ignore_calls): NOT a proof.  The
+            # id travels with the verdict through every cache and every caller.
+            key = name if name in self.declared_free else name.split(".")[-1]
+            self._note({f"declared-free:{key}"})
+            return True, False
         ident = self.identity(ctx, func)
         if ident is not None:
             kind, name = ident
@@ -1314,7 +1359,12 @@ class Purity:
         effect-free, otherwise logging itself may write to the database."""
         cached = self.__dict__.get("_loggers_free_cache")
         if cached is not None:
-            return cached
+            self._note(cached[1])
+            return cached[0]
+        return self._loggers_free_compute()
+
+    def _loggers_free_compute(self) -> bool:
+        self._deps.append(set())
         ok = True
         roots = [base for base in self.subclasses if base.startswith(("logging.", "structlog."))]
         classes = set()
@@ -1327,8 +1377,11 @@ class Purity:
                 if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     if not self.function_free(module, item, node.name):
                         ok = False
+        deps = frozenset(self._deps.pop())
+        if ok:
+            self._note(deps)
         if not self._stack and not self._ctor_stack:
-            self._loggers_free_cache = ok
+            self._loggers_free_cache = (ok, deps if ok else frozenset())
         return ok
 
     def _builtin_free(self, ctx: _Ctx, name: str, call: ast.Call) -> bool:
