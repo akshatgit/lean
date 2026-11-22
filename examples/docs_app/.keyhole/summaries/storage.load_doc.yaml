@@ -1,0 +1,9 @@
+# Drafted by an LLM (step 2b) because storage.load_doc has no readable source.
+# Committed so every run reuses it. Set status: reviewed once a human checks it.
+call: storage.load_doc
+args: [db, doc_id]
+status: assumed
+returns:
+  kind: read
+  resource: Document
+  selector: {eq: [{field: id}, {arg: doc_id}]}   # loads by id only, no owner check

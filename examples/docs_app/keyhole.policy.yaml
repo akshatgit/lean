@@ -1,0 +1,9 @@
+principal:
+  id: current_user.id
+resources:
+  Document:
+    confirmed: true
+    read:   owner(owner_id) or visibility == 'public'
+    update: owner(owner_id)
+    delete: owner(owner_id)
+    create: owner(owner_id)

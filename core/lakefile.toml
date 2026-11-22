@@ -1,0 +1,10 @@
+name = "keyhole"
+version = "0.1.0"
+defaultTargets = ["keyhole-core"]
+
+[[lean_lib]]
+name = "Keyhole"
+
+[[lean_exe]]
+name = "keyhole-core"
+root = "Main"
