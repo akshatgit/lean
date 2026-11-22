@@ -485,14 +485,28 @@ class FastAPISQLAlchemyAdapter:
     @staticmethod
     def _routes(fn, prefixes, index, module):
         for dec in fn.decorator_list:
-            if (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)
-                    and dec.func.attr in HTTP_METHODS and dec.args
-                    and isinstance(dec.args[0], ast.Constant)):
-                owner = _dotted(dec.func.value) or ""
-                yield (
-                    dec.func.attr.upper(), prefixes.get(owner, "") + dec.args[0].value,
-                    index.route_has_router_auth(module, owner, dec),
-                )
+            if not (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)
+                    and dec.args and isinstance(dec.args[0], ast.Constant)
+                    and isinstance(dec.args[0].value, str)):
+                continue
+            attr = dec.func.attr
+            if attr not in HTTP_METHODS and attr not in ("websocket", "api_route"):
+                continue
+            owner = _dotted(dec.func.value) or ""
+            path = prefixes.get(owner, "") + dec.args[0].value
+            auth = index.route_has_router_auth(module, owner, dec)
+            if attr in HTTP_METHODS:
+                yield attr.upper(), path, auth
+            elif attr == "websocket":
+                yield "WEBSOCKET", path, auth
+            elif attr == "api_route":
+                methods = []
+                for kw in dec.keywords:
+                    if kw.arg == "methods" and isinstance(kw.value, (ast.List, ast.Tuple)):
+                        methods = [m.value.upper() for m in kw.value.elts
+                                   if isinstance(m, ast.Constant) and isinstance(m.value, str)]
+                for method in (methods or ["GET"]):
+                    yield method, path, auth
 
 
 class _Unsupported(Exception):
@@ -501,7 +515,8 @@ class _Unsupported(Exception):
 
 class _FunctionAnalyzer:
     def __init__(self, fn, models, summaries, file, method, route, *, index=None,
-                 module="", policy=None, depth=0, call_stack=None, helper_mode=False):
+                 module="", policy=None, depth=0, call_stack=None, helper_mode=False,
+                 analyze_dependencies=True):
         self.fn, self.models, self.summaries = fn, models, summaries
         self.ep = air.Endpoint(method=method, path=route, file=file, line=fn.lineno)
         self.index = index
@@ -510,6 +525,11 @@ class _FunctionAnalyzer:
         self.depth = depth
         self.call_stack = set(call_stack or ())
         self.helper_mode = helper_mode
+        # FastAPI injects Depends(...) parameters for routes and for dependencies that are
+        # themselves injected. A helper called with explicit arguments does NOT get them
+        # injected, so its Depends parameters must not be re-analyzed (that would transfer
+        # the dependency's guard onto a row the caller passed in -> false SAFE).
+        self.analyze_dependencies = analyze_dependencies
         self.owner_class = None
         self.path_params = set(re.findall(r"{(\w+)}", route))
         self.principal = None
@@ -528,6 +548,7 @@ class _FunctionAnalyzer:
         self.conditional_depth = 0
         self.returned_row = None
         self.returned_rows: list[dict | None] = []
+        self.dependency_params: list[tuple[str, str]] = []
         self.return_states: list[_AnalysisState] = []
         self._try_throw_collectors: list[list[_AnalysisState]] = []
         self._next_effect_id = 0
@@ -539,6 +560,9 @@ class _FunctionAnalyzer:
         return self.ep
 
     def _analyze_body(self):
+        if self.analyze_dependencies:
+            for var, dep_name in self.dependency_params:
+                self._analyze_dependency(var, dep_name)
         falls_through = self._block(self.fn.body)
         terminal_states = list(self.return_states)
         if falls_through:
@@ -677,6 +701,11 @@ class _FunctionAnalyzer:
             for effect in self.ep.effects:
                 if getattr(effect, "_analysis_id", None) == effect_id:
                     effect.guards = list(row.get("guards", []))
+                    # Branch merges fold per-path guards into row["selector"] and clear
+                    # row["guards"]; the effect's selector must track that or the folded
+                    # guard is silently dropped from the emitted effect.
+                    if "selector" in row:
+                        effect.selector = row["selector"]
                     effect.assumed_from = effect.assumed_from or row.get("assumed_from")
 
     def _finalize_returned_row(self):
@@ -709,7 +738,26 @@ class _FunctionAnalyzer:
             superuser_type = self.policy and annotation_name in self.policy.superuser_types
             if dep is not None:
                 low = dep.lower()
-                if policy_dep or superuser_dep or any(k in low for k in ("user", "auth", "principal")):
+                # A parameter typed as a policy-protected resource (a model with rules,
+                # e.g. a Flow) is the object under access, not the caller, even if the
+                # dependency name happens to contain "user"/"auth". A name-only match must
+                # also not overwrite an already-chosen principal (no last-wins); an
+                # explicit policy declaration always wins.
+                arg_type = self.var_types.get(arg.arg)
+                arg_is_resource = bool(
+                    arg_type and arg_type in self.models and self.policy
+                    and any(res == arg_type for (res, _kind) in self.policy.rules)
+                )
+                user_token = ("user" in low) or ("principal" in low)
+                token_match = user_token or ("auth" in low)
+                # Exclude a resource-typed parameter matched only by a weak "auth" token
+                # (e.g. require_flow_auth -> Flow). The authenticated-user convention
+                # ("...user"/"...principal") still names the caller even when the user
+                # model itself has policy rules. A name-only match never overwrites an
+                # already-chosen principal (no last-wins); policy declarations always win.
+                exclude_resource = arg_is_resource and not user_token
+                if policy_dep or superuser_dep or (
+                        token_match and not exclude_resource and self.principal is None):
                     self.principal = arg.arg
                     self.ep.principal_binding = arg.arg
                     self.ep.principal_via = "dependency"
@@ -718,6 +766,11 @@ class _FunctionAnalyzer:
                         self.global_assumed_from = f"principal dependency {dep}"
                 elif any(k in low for k in ("db", "session")):
                     self.db_vars.add(arg.arg)
+                else:
+                    # A dependency that may load and authorize a resource (the dominant
+                    # FastAPI idiom, e.g. `flow: Flow = Depends(get_flow)`). Analyze its
+                    # body so its row read and ownership guards are modeled, not ignored.
+                    self.dependency_params.append((arg.arg, dep))
                 continue
             if policy_type or superuser_type:
                 self.principal = arg.arg
@@ -978,7 +1031,12 @@ class _FunctionAnalyzer:
             self._mark_unresolved_calls(s.test, "control flow")
         true_pred = self._condition_pred(s.test, True)
         false_pred = self._condition_pred(s.test, False)
-        if true_pred is None or false_pred is None:
+        # For a bare `if X: raise`, only the fall-through (false) branch survives, so
+        # a not-found check like `if doc is None: raise` is fully modeled as soon as
+        # its false predicate is known; the raised branch's predicate is irrelevant and
+        # must not be logged as a dropped check (which would spuriously demote findings).
+        missing = (false_pred is None) if direct_denial else (true_pred is None or false_pred is None)
+        if missing:
             self.ep.unmodeled_checks.append(
                 air.UnmodeledCheck(ast.unparse(s.test)[:120], s.lineno)
             )
@@ -1133,6 +1191,12 @@ class _FunctionAnalyzer:
             if isinstance(value, ast.Call):
                 constructor = (_dotted(value.func) or "").split(".")[-1]
                 if constructor in CONTAINER_TYPES:
+                    # A container wrapper such as `list(await session.exec(select(X)))`
+                    # still performs the inner query; extract its effects before binding
+                    # the variable as an opaque container.
+                    for inner in [*value.args, *(kw.value for kw in value.keywords)]:
+                        if isinstance(inner, (ast.Call, ast.Await)):
+                            self._expr_effects(inner, line)
                     self.var_types[target.id] = constructor
                     self.unresolved_values.pop(target.id, None)
                     return
@@ -1344,6 +1408,7 @@ class _FunctionAnalyzer:
                 ref.node, self.models, self.summaries, ref.file, "HELPER", qualified,
                 index=self.index, module=ref.module, policy=self.policy,
                 depth=self.depth + 1, call_stack=self.call_stack | {qualified}, helper_mode=True,
+                analyze_dependencies=False,
             )
             child.owner_class = ref.owner_class
             if ref.owner_class:
@@ -1385,7 +1450,9 @@ class _FunctionAnalyzer:
                 self.index.summary_cache[cache_key] = copy.deepcopy(analysis)
 
         copied_effects = []
+        effect_by_child_id = {}
         for effect in analysis.effects:
+            child_id = getattr(effect, "_analysis_id", None)
             copied = copy.deepcopy(effect)
             copied.selector = self._substitute_pred(copied.selector, bound)
             copied.guards = [
@@ -1398,6 +1465,8 @@ class _FunctionAnalyzer:
             self._next_effect_id += 1
             self.ep.effects.append(copied)
             copied_effects.append(copied)
+            if child_id is not None:
+                effect_by_child_id[child_id] = copied
         for opaque in analysis.opaque:
             self.ep.opaque.append(air.Opaque(opaque.call, opaque.reason, line, opaque.may_block))
         for check in analysis.unmodeled_checks:
@@ -1423,14 +1492,75 @@ class _FunctionAnalyzer:
             row["assumed_from"] = row.get("assumed_from") or self.global_assumed_from
             row["line"] = line
             row["read_emitted"] = True
-            row["effect"] = next(
-                (effect for effect in copied_effects
-                 if effect.kind == "read" and effect.resource == row["model"]),
-                None,
-            )
+            row["effect"] = effect_by_child_id.get(row.get("effect_id"))
             row["effect_id"] = getattr(row["effect"], "_analysis_id", None)
             self.rows[var] = row
         return bool(analysis.effects or analysis.opaque or analysis.returned_row or analysis.row_guards)
+
+    def _analyze_dependency(self, var, dep_name):
+        """Model a `Depends(get_x)` parameter: its body's row read and the ownership
+        guards it enforces, mapped onto the endpoint variable `var`. If the dependency
+        loads a resource we cannot see into, mark it opaque (UNKNOWN), never silent."""
+        if self.index is None:
+            return
+        line = self.fn.lineno
+        arg_type = self.var_types.get(var)
+        typed_resource = bool(arg_type and arg_type in self.models)
+        ref = self.index.resolve_function(self.module, dep_name, self.var_types, self.owner_class)
+        if ref is None:
+            if typed_resource:
+                self.ep.opaque.append(
+                    air.Opaque(f"{dep_name}(...)", "dependency_source_unavailable", line)
+                )
+            return
+        qualified = ".".join(x for x in (ref.module, ref.owner_class, ref.node.name) if x)
+        if self.depth >= 3 or qualified in self.call_stack:
+            self.ep.opaque.append(air.Opaque(f"{qualified}(...)", "recursion_or_depth_limit", line))
+            return
+        if not (typed_resource or self.index.function_may_touch_db(ref)):
+            return  # a service/settings dependency with no object access
+
+        child = _FunctionAnalyzer(
+            ref.node, self.models, self.summaries, ref.file, "DEPENDENCY", qualified,
+            index=self.index, module=ref.module, policy=self.policy,
+            depth=self.depth + 1, call_stack=self.call_stack | {qualified}, helper_mode=True,
+        )
+        child.owner_class = ref.owner_class
+        if ref.owner_class:
+            child.db_vars.update({"self.session", "self.db"})
+        child._signature()
+        child._analyze_body()
+
+        returned = child.returned_row
+        id_map = {}
+        for effect in child.ep.effects:
+            child_id = getattr(effect, "_analysis_id", None)
+            copied = copy.deepcopy(effect)
+            copied.guards = [*self.global_guards, *copied.guards]
+            copied.assumed_from = copied.assumed_from or self.global_assumed_from
+            copied.line = line
+            copied._analysis_id = self._next_effect_id
+            self._next_effect_id += 1
+            self.ep.effects.append(copied)
+            if child_id is not None:
+                id_map[child_id] = copied
+        for opaque in child.ep.opaque:
+            self.ep.opaque.append(air.Opaque(opaque.call, opaque.reason, line, opaque.may_block))
+        for check in child.ep.unmodeled_checks:
+            self.ep.unmodeled_checks.append(air.UnmodeledCheck(check.expression, line))
+
+        if returned is not None:
+            # Bind the returned row to ITS OWN read effect (via the child effect id),
+            # not merely the first read of that model, or an unguarded sibling read of
+            # the same model would be overwritten with the guarded selector -> false SAFE.
+            copied_read = id_map.get(returned.get("effect_id"))
+            row = copy.deepcopy(returned)
+            row["guards"] = [*self.global_guards, *row.get("guards", [])]
+            row["line"] = line
+            row["read_emitted"] = True
+            row["effect"] = copied_read
+            row["effect_id"] = getattr(copied_read, "_analysis_id", None)
+            self.rows[var] = row
 
     def _helper(self, var, call, line):
         name = _dotted(call.func)
@@ -1489,21 +1619,41 @@ class _FunctionAnalyzer:
         if self._call_relevant(call):
             self.ep.opaque.append(air.Opaque(f"{display_name}(...)", "source_unavailable", line))
 
+    def _update_row(self, var, line):
+        if var in self.rows and var not in self.updated:
+            r = self.rows[var]
+            self.updated.add(var)
+            self._emit("update", r["model"], r["selector"], list(r["guards"]), line, r["assumed_from"])
+
     def _call(self, call, line):
         f = call.func
-        if isinstance(f, ast.Attribute) and _dotted(f.value) in self.db_vars and call.args:
-            arg = call.args[0]
-            var = arg.id if isinstance(arg, ast.Name) else None
-            if f.attr == "delete" and var in self.rows:
-                r = self.rows[var]
-                self._emit("delete", r["model"], r["selector"], list(r["guards"]), line, r["assumed_from"])
+        # setattr(row, "attr", value) mutates a tracked row; the attribute-assignment
+        # path misses it and setattr is otherwise in IGNORED_CALLS.
+        if (isinstance(f, ast.Name) and f.id == "setattr" and call.args
+                and isinstance(call.args[0], ast.Name) and call.args[0].id in self.rows):
+            self._update_row(call.args[0].id, line)
+            return
+        if isinstance(f, ast.Attribute):
+            recv = _dotted(f.value)
+            # row.sqlmodel_update(...) writes new values into a tracked row in place.
+            if f.attr == "sqlmodel_update" and recv in self.rows:
+                self._update_row(recv, line)
                 return
-            if f.attr == "add" and var in self.creates:
-                c = self.creates.pop(var)
-                self._emit("create", c["model"], air.and_(*c["fields"]), list(self.global_guards), line)
-                return
-            if f.attr == "add" and var in self.rows:
-                return
+            if recv in self.db_vars and call.args:
+                arg = call.args[0]
+                var = arg.id if isinstance(arg, ast.Name) else None
+                if f.attr == "delete" and var in self.rows:
+                    r = self.rows[var]
+                    self._emit("delete", r["model"], r["selector"], list(r["guards"]), line, r["assumed_from"])
+                    return
+                if f.attr in ("add", "merge") and var in self.creates:
+                    c = self.creates.pop(var)
+                    self._emit("create", c["model"], air.and_(*c["fields"]), list(self.global_guards), line)
+                    return
+                if f.attr in ("add", "merge") and var in self.rows:
+                    # Re-persisting an already-loaded row is a conservative update.
+                    self._update_row(var, line)
+                    return
         self._expr_effects(call, line)
 
     def _expr_effects(self, e, line):

@@ -11,6 +11,7 @@ from . import air
 LABEL = {
     "safe": "SAFE",
     "safe_assumed": "SAFE (assumed)",
+    "no_effects": "NO EFFECTS",
     "possible_violation": "POSSIBLE VIOLATION",
     "violation": "VIOLATION",
     "unknown": "UNKNOWN",
@@ -49,17 +50,15 @@ def _review_reasons(res) -> list[str]:
 
 def _display_status(res) -> tuple[str, str]:
     """Return a report label and a stable CSS/filter key."""
-    if res.verdict == "violation":
-        return "VIOLATION (modeled)", "violation"
-    if res.verdict == "possible_violation":
-        return "Possible violation", "possible_violation"
-    if res.verdict == "unknown":
-        return "Unknown", "unknown"
-    if res.verdict == "safe_assumed":
-        return "Safe (assumed)", "safe_assumed"
-    if not res.endpoint.effects:
-        return "No modeled effects", "no_effects"
-    return "Verified safe", "safe"
+    labels = {
+        "violation": "VIOLATION (modeled)",
+        "possible_violation": "Possible violation",
+        "unknown": "Unknown",
+        "safe_assumed": "Safe (assumed)",
+        "no_effects": "No modeled effects",
+        "safe": "Verified safe",
+    }
+    return labels[res.verdict], res.verdict
 
 
 def _status_explanation(res) -> str:
@@ -443,7 +442,7 @@ def html_report(results, policy, title: str = "Keyhole security report") -> str:
         results,
         key=lambda r: (
             {"violation": 0, "possible_violation": 1, "unknown": 2,
-             "safe_assumed": 3, "safe": 4}[r.verdict],
+             "safe_assumed": 3, "safe": 4, "no_effects": 5}[r.verdict],
             r.endpoint.file,
             r.endpoint.line,
         ),

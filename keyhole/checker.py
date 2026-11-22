@@ -16,7 +16,8 @@ from pathlib import Path
 from .air import Endpoint
 from .policy import Policy
 
-RANK = {"safe": 0, "safe_assumed": 1, "unknown": 2, "possible_violation": 3, "violation": 4}
+RANK = {"no_effects": 0, "safe": 0, "safe_assumed": 1, "unknown": 2,
+        "possible_violation": 3, "violation": 4}
 
 
 def core_binary() -> str:
@@ -86,6 +87,11 @@ def check_endpoints(endpoints: list, policy: Policy) -> list:
                     for check in ep.unmodeled_checks
                     if check.line <= e.line
                 )
+                # A hard VIOLATION is only reportable against a confirmed policy. An
+                # inferred/auto-generated policy may itself be wrong, so an unconfirmed
+                # policy demotes the counterexample to a lead, never a finding.
+                if not policy.is_confirmed(e.resource):
+                    blockers.append(f"policy for {e.resource} is not confirmed")
                 blockers = sorted(set(blockers))
                 if blockers:
                     verdict = "possible_violation"
@@ -103,6 +109,12 @@ def check_endpoints(endpoints: list, policy: Policy) -> list:
 
 
 def _aggregate(res: EndpointResult, ep: Endpoint) -> str:
+    # No modeled object access at all. If the adapter also recorded an opaque
+    # operation, it *failed* to model something -> UNKNOWN. Otherwise there is
+    # genuinely nothing to check, but that is still not a proof of safety, so it
+    # is reported as its own `no_effects` state and never counted as SAFE.
+    if not res.effects:
+        return "unknown" if ep.opaque else "no_effects"
     worst = "safe"
     for er in res.effects:
         if RANK[er.verdict] > RANK[worst]:

@@ -1,27 +1,29 @@
 {
-  "endpoints": 380,
+  "endpoints": 396,
   "verdict_counts": {
-    "safe": 45,
-    "safe_assumed": 6,
-    "possible_violation": 157,
-    "violation": 10,
+    "safe": 0,
+    "safe_assumed": 7,
+    "no_effects": 50,
+    "possible_violation": 177,
+    "violation": 0,
     "unknown": 162
   },
   "unknown_causes": {
     "by_reason": {
-      "source_unavailable": 296,
+      "source_unavailable": 298,
       "unresolved_result_in_returned_response": 149,
-      "recursion_or_depth_limit": 137,
-      "unresolved_result_in_control_flow": 129,
-      "dynamic_query_helper": 91,
-      "unresolved_result_in_row_selector": 22
+      "recursion_or_depth_limit": 128,
+      "unresolved_result_in_control_flow": 128,
+      "dynamic_query_helper": 82,
+      "unresolved_result_in_row_selector": 22,
+      "dependency_source_unavailable": 6
     },
     "by_call": {
-      "langflow.services.authorization.guards._audit_guard_decision": 74,
-      "<unknown>": 61,
-      "session.exec": 55,
-      "select": 40,
-      "langflow.services.authorization.guards.ensure_permission": 37,
+      "langflow.services.authorization.guards._audit_guard_decision": 68,
+      "<unknown>": 57,
+      "session.exec": 54,
+      "select": 38,
+      "langflow.services.authorization.guards.ensure_permission": 34,
       "record['steps'].get": 32,
       "session.add": 28,
       "Path": 17,
@@ -31,14 +33,14 @@
       "session.delete": 15,
       "_snapshot_from_row": 11,
       "variable_service.get_variable_object": 11,
-      "authz.is_enabled": 10,
-      "stmt.with_for_update": 10,
-      "get_user_limiter_key": 8,
+      "authz.is_enabled": 9,
+      "stmt.with_for_update": 9,
       "variable.get": 8,
       "CatalogPolicyRule.resource_kind.in_": 7,
       "PolicyBundleSnapshot": 7,
       "error_for_client": 7,
       "get_store_service": 7,
+      "get_user_limiter_key": 7,
       "metadata.get": 7,
       "resolve_serving_scope": 7,
       "result_data.get": 7,
@@ -51,6 +53,7 @@
       "provider_policy_attributes_for_flow": 5,
       "ComposerUrlResponse": 4,
       "aresolve_integration_policy": 4,
+      "flow_storage_scope": 4,
       "operation": 4,
       "provider_dict.get": 4,
       "release_db_transaction": 4,
@@ -60,6 +63,7 @@
       "_messages_for_user_stmt": 3,
       "_paged_session_ids_stmt": 3,
       "asyncio.to_thread": 3,
+      "get_authorized_flow_for_read": 3,
       "get_project_sse_url": 3,
       "get_project_streamable_http_url": 3,
       "langflow.services.authorization.audit._stage_audit_entries": 3,
@@ -67,7 +71,6 @@
       "record.get": 3,
       "replace_with_live_models": 3,
       "resolve_component_code_for_action": 3,
-      "to_utc": 3,
       "webhook_event_manager.emit": 3,
       "AuthorizationMutation": 2,
       "CursorState": 2,
@@ -86,6 +89,7 @@
       "decrypted.get": 2,
       "errors.get": 2,
       "existing.done": 2,
+      "get_authorized_flow_for_write": 2,
       "get_flow_events_response": 2,
       "get_model_provider_variable_mapping": 2,
       "get_variable_service": 2,
@@ -98,7 +102,6 @@
       "log_buffer.get_before_timestamp": 2,
       "model.get": 2,
       "node.get": 2,
-      "owner_visibility": 2,
       "p.exists": 2,
       "plugin_features.get": 2,
       "policy.filter": 2,
@@ -107,8 +110,8 @@
       "row.validation.get": 2,
       "service.count_for_user": 2,
       "service.stage_identity_mutation": 2,
-      "session.add_all": 2,
       "set_current_model_provider_policy_context": 2,
+      "storage_service.get_file": 2,
       "storage_service.get_file_size": 2,
       "to_thread": 2,
       "translate_component_node": 2,
@@ -120,6 +123,7 @@
       "ExecutionCreate": 1,
       "IngressRequest": 1,
       "PromptValidationResponse": 1,
+      "UploadFileResponse": 1,
       "WorkflowResumeResponse": 1,
       "_GUIDANCE.get": 1,
       "_Page": 1,
@@ -130,7 +134,6 @@
       "_stream_vertex_with_provider_scope": 1,
       "ablocked_template_positions": 1,
       "administration_audit_details": 1,
-      "apply_owned_or_visible_scope_prefilter": 1,
       "archive.write_json": 1,
       "auth.create_refresh_token": 1,
       "auth_utils.encrypt_api_key": 1,
@@ -162,6 +165,7 @@
       "deployment_mapper.shape_execution_status_result": 1,
       "deployment_mapper.shape_flow_version_list_result": 1,
       "descriptor.display_name.casefold": 1,
+      "dict.fromkeys": 1,
       "end_user_id.casefold": 1,
       "ensure_flow_permission": 1,
       "error_stream": 1,
@@ -175,6 +179,7 @@
       "filters.with_until": 1,
       "generations.add": 1,
       "get_auth_service": 1,
+      "get_authorized_flow_for_delete": 1,
       "get_composer_sse_url": 1,
       "get_composer_streamable_http_url": 1,
       "get_embedding_model_options": 1,
@@ -213,12 +218,14 @@
       "service.events": 1,
       "service.replace_blocked_component_keys": 1,
       "service.replace_blocked_template_keys": 1,
+      "session.add_all": 1,
       "session.execute": 1,
       "slack_ingress.fan_out": 1,
       "stamp_execution_principal": 1,
       "start_run": 1,
-      "storage_service.get_file": 1,
+      "str": 1,
       "term.strip": 1,
+      "to_utc": 1,
       "translate": 1,
       "update_component_build_config": 1,
       "user_storage_scope_for_path": 1,
@@ -230,27 +237,27 @@
       {
         "reason": "recursion_or_depth_limit",
         "call": "langflow.services.authorization.guards._audit_guard_decision",
-        "count": 74
+        "count": 68
       },
       {
         "reason": "dynamic_query_helper",
         "call": "select",
-        "count": 39
+        "count": 37
       },
       {
         "reason": "source_unavailable",
         "call": "<unknown>",
-        "count": 38
-      },
-      {
-        "reason": "recursion_or_depth_limit",
-        "call": "langflow.services.authorization.guards.ensure_permission",
         "count": 37
       },
       {
         "reason": "source_unavailable",
         "call": "session.exec",
         "count": 35
+      },
+      {
+        "reason": "recursion_or_depth_limit",
+        "call": "langflow.services.authorization.guards.ensure_permission",
+        "count": 34
       },
       {
         "reason": "unresolved_result_in_control_flow",
@@ -274,7 +281,7 @@
       },
       {
         "reason": "unresolved_result_in_returned_response",
-        "call": "<unknown>",
+        "call": "Path",
         "count": 17
       }
     ]

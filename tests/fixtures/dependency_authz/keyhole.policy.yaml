@@ -1,0 +1,7 @@
+principal:
+  id: current_user.id
+resources:
+  Document:
+    confirmed: true
+    read: owner(owner_id)
+    update: owner(owner_id)
