@@ -125,9 +125,20 @@ class Opaque:
     call: str
     reason: str
     line: int = 0
+    may_block: bool = True
 
     def to_json(self) -> dict:
-        return {"call": self.call, "reason": self.reason, "line": self.line}
+        return {"call": self.call, "reason": self.reason, "line": self.line,
+                "may_block": self.may_block}
+
+
+@dataclass
+class UnmodeledCheck:
+    expression: str
+    line: int = 0
+
+    def to_json(self) -> dict:
+        return {"expression": self.expression, "line": self.line}
 
 
 @dataclass
@@ -141,6 +152,7 @@ class Endpoint:
     params: dict = field(default_factory=dict)
     effects: list = field(default_factory=list)
     opaque: list = field(default_factory=list)
+    unmodeled_checks: list = field(default_factory=list)
 
     @property
     def key(self) -> str:
@@ -155,4 +167,5 @@ class Endpoint:
             "params": {k: p.to_json() for k, p in self.params.items()},
             "effects": [e.to_json() for e in self.effects],
             "opaque": [o.to_json() for o in self.opaque],
+            "unmodeled_checks": [c.to_json() for c in self.unmodeled_checks],
         }

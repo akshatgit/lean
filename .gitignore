@@ -3,3 +3,5 @@ __pycache__/
 .pytest_cache/
 core/.lake/
 *.sarif
+.venv/
+langflow-claude-policy-docker-report.html

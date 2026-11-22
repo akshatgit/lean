@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use Keyhole in your work, please cite this software."
+title: "Keyhole: A Lean-verified IDOR detector for web APIs"
+type: software
+authors:
+  - family-names: "akshatgit"
+version: 0.1.0
+repository-code: "https://github.com/akshatgit/lean"
+url: "https://github.com/akshatgit/lean"
+abstract: >-
+  Keyhole is a static analyzer for insecure direct object reference (IDOR)
+  vulnerabilities in web APIs. Its authorization checker and counterexample
+  validation are implemented and proved sound in Lean 4.
+keywords:
+  - IDOR
+  - authorization
+  - static analysis
+  - Lean 4
+  - formal verification

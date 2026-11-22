@@ -18,5 +18,6 @@ class Adapter(Protocol):
     def detect(self, repo: Path) -> float:
         """Confidence 0-1 that this adapter applies to the repo."""
 
-    def extract(self, repo: Path, summaries: dict) -> list[Endpoint]:
+    def extract(self, repo: Path, summaries: dict, *, include_tests: bool = False,
+                policy=None) -> list[Endpoint]:
         """Return one AIR endpoint per route found."""

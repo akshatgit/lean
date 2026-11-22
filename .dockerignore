@@ -1,0 +1,11 @@
+.git
+.pytest_cache
+**/__pycache__
+**/*.pyc
+core/.lake
+tests
+examples
+docs
+langflow-*.html
+langflow-*.txt
+langflow-*.json

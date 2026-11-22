@@ -2,9 +2,10 @@ from pathlib import Path
 
 import pytest
 
-from keyhole import air
+from keyhole import air, report
 from keyhole.adapters import FastAPISQLAlchemyAdapter
 from keyhole.checker import check_endpoints
+from keyhole.cli import main
 from keyhole.policy import load_policy, parse_rule
 from keyhole.summaries import load_summaries
 
@@ -84,3 +85,29 @@ def test_without_summary_storage_is_unknown():
     policy = load_policy(DEMO / "keyhole.policy.yaml")
     res = {r.endpoint.key: r for r in check_endpoints(endpoints, policy)}
     assert res["GET /api/v1/storage/{doc_id}"].verdict == "unknown"
+
+
+def test_html_report_is_human_readable_and_filterable(results):
+    policy = load_policy(DEMO / "keyhole.policy.yaml")
+    page = report.html_report(list(results.values()), policy, title="Demo security report")
+
+    assert "How to read this report" in page
+    assert "Possible violation" in page
+    assert "VIOLATION (modeled)" in page
+    assert report.MODEL_TRUST_NOTICE in page
+    assert "No modeled effects" in page
+    assert 'id="filter-search"' in page
+    assert 'id="filter-verdict"' in page
+    assert 'id="filter-resource"' in page
+    assert 'id="filter-review"' in page
+    assert "Rows touched when" in page
+    assert "Policy allows when" in page
+    assert "GET /api/v1/documents/{doc_id}" in page
+
+
+def test_cli_writes_html_report(tmp_path):
+    output = tmp_path / "report.html"
+    status = main(["scan", str(DEMO), "--format", "html", "--out", str(output)])
+
+    assert status == 1
+    assert output.read_text().startswith("<!doctype html>")

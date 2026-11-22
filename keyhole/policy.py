@@ -45,6 +45,13 @@ class Policy:
     rules: dict = field(default_factory=dict)        # (resource, kind) -> pred
     confirmed: dict = field(default_factory=dict)    # resource -> bool
     id_attr: str = "id"
+    principal_dependencies: set[str] = field(default_factory=set)
+    principal_types: set[str] = field(default_factory=set)
+    superuser_dependencies: set[str] = field(default_factory=set)
+    superuser_types: set[str] = field(default_factory=set)
+    helper_guards: dict[str, air.Pred] = field(default_factory=dict)
+    ignored_calls: set[str] = field(default_factory=set)
+    metadata: dict[str, str] = field(default_factory=dict)
 
     def to_json(self) -> list:
         return [{"resource": r, "kind": k, "allow": p} for (r, k), p in self.rules.items()]
@@ -148,7 +155,22 @@ def load_policy(path: str | Path) -> Policy:
     id_attr = str(pr.get("id", "current_user.id")).split(".")[-1]
     bypass = pr.get("bypass")
     bypass_pred = air.eq(air.principal(str(bypass).split(".")[-1]), air.const("true")) if bypass else None
-    pol = Policy(id_attr=id_attr)
+    pol = Policy(
+        id_attr=id_attr,
+        principal_dependencies={str(x) for x in (pr.get("dependencies") or [])},
+        principal_types={str(x) for x in (pr.get("types") or [])},
+        superuser_dependencies={str(x) for x in (pr.get("superuser_dependencies") or [])},
+        superuser_types={str(x) for x in (pr.get("superuser_types") or [])},
+        metadata={
+            key: str(data[key])
+            for key in ("generated_by", "status", "generated_at", "source_revision")
+            if data.get(key) is not None
+        },
+    )
+    for name, rule in (data.get("helpers") or {}).items():
+        pol.helper_guards[str(name)] = parse_rule(rule, id_attr)
+    adapter_config = data.get("adapter") or {}
+    pol.ignored_calls = {str(x) for x in (adapter_config.get("ignore_calls") or [])}
     for res, rules in (data.get("resources") or {}).items():
         pol.confirmed[res] = bool(rules.get("confirmed", False))
         for kind in air.KINDS:

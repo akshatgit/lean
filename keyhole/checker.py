@@ -16,7 +16,7 @@ from pathlib import Path
 from .air import Endpoint
 from .policy import Policy
 
-RANK = {"safe": 0, "safe_assumed": 1, "unknown": 2, "violation": 3}
+RANK = {"safe": 0, "safe_assumed": 1, "unknown": 2, "possible_violation": 3, "violation": 4}
 
 
 def core_binary() -> str:
@@ -39,6 +39,7 @@ class EffectResult:
     verdict: str              # safe | violation | unknown
     witness: dict | None = None
     why: str | None = None
+    blocking_calls: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -73,9 +74,26 @@ def check_endpoints(endpoints: list, policy: Policy) -> list:
         res = EndpointResult(ep)
         for j, e in enumerate(ep.effects):
             r = verdicts[f"{i}:{j}"]
-            res.effects.append(EffectResult(e, r["verdict"], r.get("witness"), r.get("why")))
+            verdict = r["verdict"]
+            blockers = []
+            if verdict == "violation":
+                blockers = sorted({
+                    o.call for o in ep.opaque
+                    if o.may_block and o.line <= e.line
+                })
+                blockers.extend(
+                    f"unmodelled check at line {check.line}: {check.expression}"
+                    for check in ep.unmodeled_checks
+                    if check.line <= e.line
+                )
+                blockers = sorted(set(blockers))
+                if blockers:
+                    verdict = "possible_violation"
+            res.effects.append(EffectResult(
+                e, verdict, r.get("witness"), r.get("why"), blockers
+            ))
             if e.assumed_from:
-                res.assumptions.append(f"summary for {e.assumed_from} (LLM, not reviewed)")
+                res.assumptions.append(f"trusted helper/summary for {e.assumed_from} (not reviewed)")
             if not policy.is_confirmed(e.resource):
                 res.assumptions.append(f"policy for {e.resource} is inferred, not confirmed")
         res.assumptions = sorted(set(res.assumptions))
