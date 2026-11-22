@@ -420,6 +420,51 @@ class _RepoIndex:
         return False
 
 
+class _FieldTerm(dict):
+    """An AIR `{"field": name}` term that remembers which local row variable it was read
+    from.  AIR itself has a single implicit row per effect, so a field term is only
+    meaningful for the effect on THAT row.  `row` is:
+        a variable name - the field was read off that tracked row (`doc.owner_id`)
+        None            - a column of the query being built (`Doc.owner_id` in a filter)
+        "?"             - a field with no row we can name (must never constrain a row)
+    Serialises and compares like the plain dict; two provenance-carrying terms are equal
+    only if they name the same row."""
+
+    def __init__(self, name: str, row: str | None = None):
+        super().__init__(field=name)
+        self.row = row
+
+    def __eq__(self, other):
+        if not dict.__eq__(self, other):
+            return False
+        return not isinstance(other, _FieldTerm) or other.row == self.row
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    __hash__ = None
+
+    def __deepcopy__(self, memo):
+        return _FieldTerm(self["field"], self.row)
+
+
+def _field_rows(pred) -> set:
+    """Provenance of every field term inside a predicate ("?" when unknown)."""
+    out = set()
+    todo = [pred]
+    while todo:
+        node = todo.pop()
+        if isinstance(node, dict):
+            if "field" in node:
+                row = getattr(node, "row", "?")
+                out.add("?" if row is None else row)
+            else:
+                todo.extend(node.values())
+        elif isinstance(node, (list, tuple)):
+            todo.extend(node)
+    return out
+
+
 @dataclass
 class _QueryState:
     model: str
@@ -584,6 +629,9 @@ class _FunctionAnalyzer:
         self.returned_row = None
         self.returned_rows: list[dict | None] = []
         self.dependency_params: list[tuple[str, str, str]] = []  # (param, dependency, module)
+        self.unverified_principals: list[tuple[str, str, str]] = []  # name-matched principals
+        # Effects that exist only because a principal dependency fetched the caller.
+        self._principal_effect_ids: set[int] = set()
         self.return_states: list[_AnalysisState] = []
         self._try_throw_collectors: list[list[_AnalysisState]] = []
         self._next_effect_id = 0
@@ -611,14 +659,23 @@ class _FunctionAnalyzer:
 
     def _analyze_body(self):
         if self.analyze_dependencies:
+            for var, dep_name, dep_module in self.unverified_principals:
+                self._analyze_dependency(var, dep_name, dep_module, as_principal=True)
             for var, dep_name, dep_module in self.dependency_params:
                 self._analyze_dependency(var, dep_name, dep_module)
             if not self.helper_mode:
                 self._endpoint_decorators()
                 # `@router.get(..., dependencies=[Depends(f)])` runs f before the body.
                 for i, dep_name in enumerate(self._route_dependencies()):
-                    if not (self.index and self.index.is_principal_dependency(dep_name.split(".")[-1])):
-                        self._analyze_dependency(f"<route dependency {i}>", dep_name)
+                    short = dep_name.split(".")[-1]
+                    if self.policy and (short in self.policy.principal_dependencies
+                                        or short in self.policy.superuser_dependencies):
+                        continue  # declared in the policy: trusted authentication
+                    # A name that merely looks like authentication is verified like a
+                    # name-matched principal parameter; anything else is a dependency.
+                    looks_like_auth = bool(self.index and self.index.is_principal_dependency(short))
+                    self._analyze_dependency(f"<route dependency {i}>", dep_name,
+                                             as_principal=looks_like_auth)
         falls_through = self._block(self.fn.body)
         terminal_states = list(self.return_states)
         if falls_through:
@@ -686,6 +743,13 @@ class _FunctionAnalyzer:
                       self.var_types):
             table.pop(name, None)
         self.updated.discard(name)
+        self._forget_fields_of(name)
+
+    def _forget_fields_of(self, row_var: str):
+        """`owner = doc.owner_id` is a field of the row `doc` held at that time.  Once
+        `doc` names another row the alias must not be read as a field of the new one."""
+        for alias in [n for n, t in self.values.items() if getattr(t, "row", None) == row_var]:
+            del self.values[alias]
 
     @staticmethod
     def _stored_names(node) -> set[str]:
@@ -823,6 +887,16 @@ class _FunctionAnalyzer:
     def _merge_row_bindings(self, bindings: list[dict]) -> dict:
         first = copy.deepcopy(bindings[0])
         if len(bindings) == 1:
+            return first
+        if all(row["model"] == first["model"] and row["selector"] == first["selector"]
+               and row.get("guards", []) == first.get("guards", [])
+               and row.get("effect_id") == first.get("effect_id")
+               and row.get("assumed_from") == first.get("assumed_from")
+               and row.get("read_emitted", False) == first.get("read_emitted", False)
+               for row in bindings[1:]):
+            # Every path holds the very same binding (the branches did not touch this
+            # row).  Keep it as is: re-folding `or(S, S)` at each merge would double the
+            # selector for every later branch.
             return first
         touched = [air.and_(*row.get("guards", []), row["selector"]) for row in bindings]
         if all(row["model"] == first["model"] for row in bindings):
@@ -982,6 +1056,11 @@ class _FunctionAnalyzer:
                     if superuser_dep:
                         self.global_guards.append(air.eq(air.principal("is_superuser"), air.const(True)))
                         self.global_assumed_from = f"principal dependency {dep}"
+                    if not (policy_dep or superuser_dep):
+                        # Chosen by NAME only, not declared in the policy.  The name is
+                        # not evidence of what the body does: verify it before the body
+                        # of the endpoint is analyzed (see _analyze_dependency).
+                        self.unverified_principals.append((arg.arg, dep, dep_module))
                 elif any(k in low for k in ("db", "session")):
                     self.db_vars.add(arg.arg)
                 else:
@@ -1025,7 +1104,10 @@ class _FunctionAnalyzer:
         if isinstance(e, ast.Name) and e.id in self.ep.params:
             return air.param(e.id)
         if isinstance(e, ast.Name) and e.id in self.values:
-            return self.values[e.id]
+            value = self.values[e.id]
+            if query_model is not None and "field" in value:
+                return None  # a field of some other row is not a column of this query
+            return value
         if isinstance(e, ast.Attribute) and isinstance(e.value, ast.Name):
             base = e.value.id
             if base == self.principal:
@@ -1037,9 +1119,15 @@ class _FunctionAnalyzer:
             if base in self.models:
                 if query_model is not None and base != query_model:
                     return None
-                return air.fld(e.attr)
+                # `Model.col` is a column of the query being built; outside a query
+                # (an `if` test) it names no row at all.
+                return _FieldTerm(e.attr, None if query_model is not None else "?")
             if base in self.rows or base in self.creates:
-                return air.fld(e.attr)
+                if query_model is not None:
+                    # Selector/field context: `other_row.x` is a value we cannot express,
+                    # NOT field x of the row being selected.
+                    return None
+                return _FieldTerm(e.attr, base)
         if (isinstance(e, ast.Call) and (_dotted(e.func) or "").split(".")[-1] == "col"
                 and len(e.args) == 1):
             return self.term(e.args[0], query_model=query_model)
@@ -1154,7 +1242,7 @@ class _FunctionAnalyzer:
                 return None
             state = _QueryState(model, executed=True)
             self._mark_unresolved_uses(e.args[1], "row selector")
-            term = self.term(e.args[1])
+            term = self.term(e.args[1], query_model=model)
             if term is not None:
                 state.conds.append(air.eq(air.fld("id"), term))
             return state
@@ -1183,7 +1271,7 @@ class _FunctionAnalyzer:
         elif f.attr == "filter_by":
             if self.conditional_depth == 0:
                 for kw in e.keywords:
-                    term = self.term(kw.value)
+                    term = self.term(kw.value, query_model=state.model)
                     if kw.arg and term is not None:
                         state.conds.append(air.eq(air.fld(kw.arg), term))
         elif f.attr in ("delete", "update"):
@@ -1235,15 +1323,38 @@ class _FunctionAnalyzer:
         except _Unsupported:
             return None
 
-    def _add_path_guard(self, test, pred):
-        if pred is None:
-            return
-        refs = {n.id for n in ast.walk(test) if isinstance(n, ast.Name) and n.id in self.rows}
-        if refs:
-            for ref in refs:
-                self.rows[ref]["guards"].append(pred)
+    def _conjuncts(self, test, truthy: bool):
+        """Split `test` (assumed to evaluate to `truthy`) into facts that ALL hold:
+        `A and B` true -> A, B;  `A or B` false -> not A, not B;  `not X` flips."""
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            yield from self._conjuncts(test.operand, not truthy)
+        elif isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And if truthy else ast.Or):
+            for value in test.values:
+                yield from self._conjuncts(value, truthy)
         else:
-            self.global_guards.append(pred)
+            yield test, truthy
+
+    def _add_path_guard(self, test, truthy: bool, line: int):
+        """Record what `test == truthy` proves on this path.
+
+        AIR guards have one implicit row, so a fact may only be attached to a row when
+        every field it mentions was read off that very row.  The condition is split into
+        independent conjuncts first; a conjunct that mixes fields of several rows (or
+        mentions a field with no nameable row) is attached to NOTHING.  Dropping a guard
+        only widens the modeled access; attaching it to the wrong row would let Lean
+        prove an access that was never checked."""
+        for part, polarity in self._conjuncts(test, truthy):
+            pred = self._condition_pred(part, polarity)
+            if pred is None or pred is True:
+                continue
+            sources = _field_rows(pred)
+            if not sources:
+                self.global_guards.append(pred)  # only params / principal / constants
+            elif len(sources) == 1 and next(iter(sources)) in self.rows:
+                self.rows[next(iter(sources))]["guards"].append(pred)
+            else:
+                self.ep.unmodeled_checks.append(air.UnmodeledCheck(
+                    f"cross-row guard dropped: {ast.unparse(part)[:100]}", line))
 
     def _analyze_if(self, s: ast.If) -> bool:
         base = self._snapshot()
@@ -1266,12 +1377,12 @@ class _FunctionAnalyzer:
             )
 
         self._restore(base)
-        self._add_path_guard(s.test, true_pred)
+        self._add_path_guard(s.test, True, s.lineno)
         true_falls = self._block(s.body, conditional=True)
         true_state = self._snapshot() if true_falls else None
 
         self._restore(base)
-        self._add_path_guard(s.test, false_pred)
+        self._add_path_guard(s.test, False, s.lineno)
         false_falls = self._block(s.orelse, conditional=True) if s.orelse else True
         false_state = self._snapshot() if false_falls else None
 
@@ -1409,8 +1520,9 @@ class _FunctionAnalyzer:
             for table, old in zip(tables, before):
                 if old is not None and table.get(name) is old:
                     table.pop(name)
-            if self.rows.get(name) is not before[0]:
+            if self.rows.get(name) is not before[0] or self.creates.get(name) is not before[1]:
                 self.updated.discard(name)
+                self._forget_fields_of(name)
             if name in self.queries:
                 self._query_names.add(name)
             if name in self._untrackable:
@@ -1460,7 +1572,7 @@ class _FunctionAnalyzer:
                 self._mark_unresolved_uses(kw.value, "database_mutation")
                 self._mark_unresolved_calls(kw.value, "database mutation")
             fields = [air.eq(air.fld(kw.arg), t) for kw in value.keywords
-                      if kw.arg and (t := self.term(kw.value)) is not None]
+                      if kw.arg and (t := self.term(kw.value, query_model=_dotted(value.func))) is not None]
             self.creates[target.id] = {"model": _dotted(value.func), "fields": fields, "line": line}
             return
         if isinstance(value, ast.Call):
@@ -1496,7 +1608,7 @@ class _FunctionAnalyzer:
         var = target.value.id
         if var in self.creates:
             self._visited.add(id(target))
-            t = self.term(value)
+            t = self.term(value, query_model=self.creates[var]["model"])
             if t is not None:
                 self.creates[var]["fields"].append(air.eq(air.fld(target.attr), t))
         elif var in self.rows:
@@ -1512,7 +1624,10 @@ class _FunctionAnalyzer:
     def _returns_row(value):
         if not isinstance(value, ast.Call):
             return False
-        name = (_dotted(value.func) or "").split(".")[-1]
+        # The terminal method decides; the receiver may be an awaited result, as in
+        # `(await session.exec(stmt)).first()`, which has no dotted name.
+        func = value.func
+        name = func.attr if isinstance(func, ast.Attribute) else (_dotted(func) or "")
         return name in {"get", "first", "one", "one_or_none", "scalar", "scalar_one", "scalar_one_or_none"}
 
     def _ignored_call(self, name: str | None) -> bool:
@@ -1600,6 +1715,9 @@ class _FunctionAnalyzer:
             return False
         refs = {n.id for n in ast.walk(call) if isinstance(n, ast.Name) and n.id in self.rows}
         if not refs:
+            # User-declared trust (policy `helpers:`), unchanged: with no row argument the
+            # declared guard is assumed for every later effect.  Results that rely on it
+            # are always labelled SAFE (assumed), never SAFE.
             self.global_guards.append(self.policy.helper_guards[key])
             self.global_assumed_from = key
             return True
@@ -1636,7 +1754,12 @@ class _FunctionAnalyzer:
         def term(item):
             if isinstance(item, dict) and "param" in item:
                 actual = bound.get(item["param"])
-                return self.term(actual) if actual is not None else None
+                actual_term = self.term(actual) if actual is not None else None
+                if actual_term is not None and "field" in actual_term:
+                    # A field of one of the CALLER's rows is not a field of the row this
+                    # predicate is about: widen rather than conflate the two rows.
+                    return None
+                return actual_term
             return item
 
         if kind == "eq":
@@ -1670,8 +1793,14 @@ class _FunctionAnalyzer:
                 role = f"row:{self.rows[actual.id]['model']}"
                 has_row_arg = True
             roles.append((name, role))
-        cache_key = (qualified, tuple(sorted(roles)), skip_first)
-        analysis = None if has_row_arg else self.index.summary_cache.get(cache_key)
+        # The child's analysis is a function of the argument roles and, for row
+        # arguments, of the state each row is seeded with (model, selector, guards).
+        seeds = tuple(sorted(
+            (name, repr((self.rows[bound[name].id]["model"], self.rows[bound[name].id]["selector"],
+                         self.rows[bound[name].id]["guards"])))
+            for name, role in roles if role.startswith("row:")))
+        cache_key = (qualified, tuple(sorted(roles)), skip_first, seeds)
+        analysis = self.index.summary_cache.get(cache_key)
 
         if analysis is None:
             child = _FunctionAnalyzer(
@@ -1716,8 +1845,7 @@ class _FunctionAnalyzer:
                 copy.deepcopy(child.ep.unmodeled_checks), copy.deepcopy(child.returned_row),
                 copy.deepcopy(row_guards),
             )
-            if not has_row_arg:
-                self.index.summary_cache[cache_key] = copy.deepcopy(analysis)
+            self.index.summary_cache[cache_key] = copy.deepcopy(analysis)
 
         copied_effects = []
         effect_by_child_id = {}
@@ -1768,10 +1896,21 @@ class _FunctionAnalyzer:
             self.rows[var] = row
         return bool(analysis.effects or analysis.opaque or analysis.returned_row or analysis.row_guards)
 
-    def _analyze_dependency(self, var, dep_name, dep_module=None):
+    def _analyze_dependency(self, var, dep_name, dep_module=None, as_principal=False):
         """Model a `Depends(get_x)` parameter: its body's row read and the ownership
         guards it enforces, mapped onto the endpoint variable `var`. If the dependency
-        loads a resource we cannot see into, mark it opaque (UNKNOWN), never silent."""
+        loads a resource we cannot see into, mark it opaque (UNKNOWN), never silent.
+
+        `as_principal`: `var` was taken to be the caller because of the dependency's NAME
+        only.  That choice must not hide anything the dependency does:
+          * unreadable body            -> opaque, the endpoint cannot be SAFE;
+          * provably touches no table  -> a plain principal, nothing to add;
+          * touches tables and itself depends on a principal -> it is a resource
+            loader, not the caller: demoted to an ordinary dependency;
+          * touches tables, no principal of its own -> stays the principal, but every
+            effect in its body is emitted and checked.  Only the read of the row it
+            returns gets the identity fact `row.<id> == principal.<id>`, which is what
+            "this row is the caller" means; any other read/write is checked as is."""
         if self.index is None:
             return
         line = self.fn.lineno
@@ -1787,7 +1926,9 @@ class _FunctionAnalyzer:
         if ref is None:
             # FastAPI runs this code before the handler.  If we cannot read it we
             # cannot rule out object access, whatever the parameter is typed as.
-            self._opaque(f"{dep_name}(...)", "dependency_source_unavailable", line)
+            self._opaque(f"{dep_name}(...)",
+                         "principal_dependency_unverified" if as_principal
+                         else "dependency_source_unavailable", line)
             return
         qualified = ".".join(x for x in (ref.module, ref.owner_class, ref.node.name) if x)
         if not self.index.purity._decorators_ok(ref.module, ref.node, ref.owner_class):
@@ -1796,8 +1937,16 @@ class _FunctionAnalyzer:
         if self.depth >= 3 or qualified in self.call_stack:
             self._opaque(f"{qualified}(...)", "recursion_or_depth_limit", line)
             return
-        if not typed_resource and self.index.purity.function_free(
-                ref.module, ref.node, ref.owner_class):
+        # A dependency's own sub-dependencies run too, and they are parameters, not calls
+        # in its body: the effect-freedom proof of the body says nothing about them.
+        dep_args = [*ref.node.args.posonlyargs, *ref.node.args.args, *ref.node.args.kwonlyargs]
+        dep_defaults = [*ref.node.args.defaults, *ref.node.args.kw_defaults]
+        has_subdependencies = any(
+            self._depends_target(node) is not None
+            or self.index.annotation_dependency(ref.module, node) is not None
+            for node in [*dep_defaults, *(a.annotation for a in dep_args)] if node is not None)
+        if ((as_principal or not typed_resource) and not has_subdependencies
+                and self.index.purity.function_free(ref.module, ref.node, ref.owner_class)):
             return  # proven unable to touch the database (e.g. a settings provider)
 
         child = _FunctionAnalyzer(
@@ -1810,6 +1959,20 @@ class _FunctionAnalyzer:
             child.db_vars.update({"self.session", "self.db"})
         child._signature()
         child._analyze_body()
+
+        bind_row = True
+        if as_principal:
+            bind_row = False
+            own_effects = [e for e in child.ep.effects
+                           if getattr(e, "_analysis_id", None) not in child._principal_effect_ids]
+            if own_effects and child.principal is not None:
+                # Beyond fetching its own caller it touches data on that caller's
+                # behalf: this is a resource loader, not the caller.
+                bind_row = True
+                if self.principal == var:
+                    self.principal = None
+                    self.ep.principal_binding = None
+                    self.ep.principal_via = "none"
 
         returned = child.returned_row
         id_map = {}
@@ -1830,6 +1993,21 @@ class _FunctionAnalyzer:
         for check in child.ep.unmodeled_checks:
             self.ep.unmodeled_checks.append(air.UnmodeledCheck(check.expression, line))
 
+        if as_principal and not bind_row:
+            self._principal_effect_ids.update(e._analysis_id for e in id_map.values())
+            own_read = id_map.get(returned.get("effect_id")) if returned is not None else None
+            id_attr = self.policy.id_attr if self.policy else "id"
+            if (own_read is not None and own_read.kind == "read"
+                    and not self._selects_by_request_id(own_read.selector, id_attr)):
+                # "The row this dependency returns IS the caller" is what choosing it as
+                # the principal means, but nothing proves it: record it as an explicit,
+                # unreviewed assumption so the result is SAFE (assumed), never SAFE.
+                # A row picked by an id taken from the request is a lookup of somebody,
+                # not authentication of the caller: no identity fact for that.
+                own_read.guards.append(air.eq(air.fld(id_attr), air.principal(id_attr)))
+                own_read.assumed_from = (
+                    f"principal dependency {dep_name} (matched by name; assumed to return the caller)")
+            return
         if returned is not None:
             # Bind the returned row to ITS OWN read effect (via the child effect id),
             # not merely the first read of that model, or an unguarded sibling read of
@@ -1842,6 +2020,20 @@ class _FunctionAnalyzer:
             row["effect"] = copied_read
             row["effect_id"] = getattr(copied_read, "_analysis_id", None)
             self.rows[var] = row
+
+    @staticmethod
+    def _selects_by_request_id(selector, id_attr: str) -> bool:
+        todo = [selector]
+        while todo:
+            node = todo.pop()
+            if isinstance(node, dict):
+                pair = node.get("eq")
+                if pair and any(t.get("field") == id_attr for t in pair) and any("param" in t for t in pair):
+                    return True
+                todo.extend(node.values())
+            elif isinstance(node, (list, tuple)):
+                todo.extend(node)
+        return False
 
     def _strict_ref(self, call):
         """The single repository definition `call` dispatches to, identified by import
@@ -1891,7 +2083,9 @@ class _FunctionAnalyzer:
                     bound[s.args[i]] = a
             for kw in call.keywords:
                 bound[kw.arg] = kw.value
-            sel = instantiate(s.selector, lambda n: self.term(bound[n]) if n in bound else None)
+            sel = instantiate(
+                s.selector,
+                lambda n: self.term(bound[n], query_model=s.resource) if n in bound else None)
             if sel is None:
                 self._opaque(f"{name}(...)", "unsupported_pattern", line)
                 return

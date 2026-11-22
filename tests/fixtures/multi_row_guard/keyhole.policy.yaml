@@ -1,0 +1,9 @@
+principal:
+  id: current_user.id
+resources:
+  Doc:
+    confirmed: true
+    read: owner(owner_id)
+  Folder:
+    confirmed: true
+    read: owner(owner_id)

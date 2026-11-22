@@ -1,0 +1,10 @@
+# No `principal.dependencies`: every principal below is recognised by NAME only.
+principal:
+  id: current_user.id
+resources:
+  User:
+    confirmed: true
+    read: owner(id)
+  Doc:
+    confirmed: true
+    read: owner(owner_id)
