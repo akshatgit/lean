@@ -563,10 +563,7 @@ class FastAPISQLAlchemyAdapter:
                 assumptions=None) -> list:
         parsed = []
         for p in _python_files(repo, include_tests=include_tests):
-            try:
-                parsed.append((p, ast.parse(p.read_text(errors="ignore"))))
-            except SyntaxError:
-                continue
+            parsed.append((p, ast.parse(p.read_bytes(), filename=str(p))))
         models = find_models(t for _, t in parsed)
         index = _RepoIndex(repo, parsed, models, policy, assumptions)
         self.last_index = index   # for `keyhole review` / `keyhole worklist`

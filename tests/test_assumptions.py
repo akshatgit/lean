@@ -344,3 +344,11 @@ def test_cli_scan_picks_up_the_file_and_worklist_runs(repo, capsys):
     assert [p["id"] for p in data["GET /emit/scalars/{doc_id}"]["provenance"]] == ["assume:A-EMIT"]
     assert main(["worklist", str(repo), "--format", "json", "--prompt-pack", str(repo / "packs")]) == 0
     assert json.loads(capsys.readouterr().out)["blocked_endpoints"] >= 1
+
+
+def test_scan_refuses_verdicts_when_a_source_file_cannot_be_parsed(repo):
+    (repo / "dependency.py").write_text("def invalid(:\n")
+    output = repo / "report.json"
+    with pytest.raises(SystemExit, match=r"dependency\.py:1 with Python"):
+        main(["scan", str(repo), "--format", "json", "--out", str(output)])
+    assert not output.exists()

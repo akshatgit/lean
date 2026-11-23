@@ -32,13 +32,17 @@ def _load(args):
     policy = load_policy(policy_path)
     assumptions = _assumptions(args, repo)
     adapter = adapters.pick(repo, getattr(args, "adapter", None))
-    endpoints = adapter.extract(
-        repo,
-        load_summaries(repo),
-        include_tests=getattr(args, "include_tests", False),
-        policy=policy,
-        assumptions=assumptions,
-    )
+    try:
+        endpoints = adapter.extract(
+            repo,
+            load_summaries(repo),
+            include_tests=getattr(args, "include_tests", False),
+            policy=policy,
+            assumptions=assumptions,
+        )
+    except SyntaxError as exc:
+        raise SystemExit(f"Cannot parse {exc.filename}:{exc.lineno} with Python "
+                         f"{sys.version_info.major}.{sys.version_info.minor}: {exc.msg}") from exc
     args._adapter, args._assumptions = adapter, assumptions
     return repo, policy, endpoints
 
