@@ -308,6 +308,10 @@ def test_worklist_ranks_targets_by_endpoints_freed():
     data = worklist.build(results, adapter.last_index.purity, top=10)
     by_target = {item["target"]: item for item in data["targets"]}
     assert data["blocked_endpoints"] == sum(r.verdict == "unknown" for r in results)
+    combined = worklist.build(results, adapter.last_index.purity, include_possible=True)
+    assert combined["blocked_by_verdict"] == {"unknown": data["blocked_endpoints"], "possible_violation": 1}
+    assert any("GET /actor/{doc_id}" in ep for item in combined["targets"] for ep in item["blocked_endpoints"])
+    assert "1 POSSIBLE VIOLATION" in worklist.text(combined)
     assert by_target["vendor.emit"]["kind"] == "external"
     assert by_target["vendor.emit"]["sole_blocker_of"] >= 2
     # an opaque deep inside the locator is also covered by an assumption on the locator

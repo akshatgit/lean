@@ -17,15 +17,17 @@ from __future__ import annotations
 
 import ast
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 
 def _target_of(opaque) -> str:
     return opaque.target or f"<{opaque.reason}> {opaque.call}"
 
 
-def build(results, purity=None, top: int = 25) -> dict:
-    blocked = [r for r in results if r.verdict == "unknown"]
+def build(results, purity=None, top: int = 25, *, include_possible: bool = False) -> dict:
+    verdicts = {"unknown", "possible_violation"} if include_possible else {"unknown"}
+    blocked = [r for r in results if r.verdict in verdicts and
+               any(op.may_have_effects for op in r.endpoint.opaque)]
     # per endpoint: the distinct "cover sets" -- an opaque is accounted for when ANY
     # symbol in its set is (its own target, or a helper call it was reached through)
     per_endpoint: dict[str, set] = {}
@@ -110,6 +112,7 @@ def build(results, purity=None, top: int = 25) -> dict:
     still = {e: sets for e, sets in remaining.items() if sets}
     return {
         "blocked_endpoints": len(blocked),
+        "blocked_by_verdict": dict(sorted(Counter(r.verdict for r in blocked).items())),
         "distinct_targets": len(presence),
         "targets": items,
         "greedy_cover": cover,
@@ -124,9 +127,12 @@ def build(results, purity=None, top: int = 25) -> dict:
 
 
 def text(worklist: dict, top: int = 25) -> str:
-    out = [f"{worklist['blocked_endpoints']} UNKNOWN endpoints are blocked by "
-           f"{worklist['distinct_targets']} distinct targets.", ""]
-    out.append("Greedy cover (cover these in order; an endpoint is freed when ALL its targets are covered):")
+    counts = ", ".join(f"{count} {verdict.replace('_', ' ').upper()}"
+                       for verdict, count in worklist["blocked_by_verdict"].items())
+    out = [f"{worklist['blocked_endpoints']} endpoints have unmodeled operations that may touch data"
+           f"{' (' + counts + ')' if counts else ''}.",
+           f"{worklist['distinct_targets']} distinct targets appear on those paths.", ""]
+    out.append("Greedy cover (an endpoint counts as freed when every effect-capable operation is covered).")
     for step in worklist["greedy_cover"][:top]:
         out.append(f"  {step['step']:>3}. +{step['frees']:<3} (total {step['freed_total']:<3}) "
                    f"[{step['kind']}] {step['target']}")

@@ -125,7 +125,7 @@ def cmd_worklist(args) -> int:
     _repo, policy, endpoints = _load(args)
     results = check_endpoints(endpoints, policy)
     purity = args._adapter.last_index.purity
-    data = worklist.build(results, purity, top=args.top)
+    data = worklist.build(results, purity, top=args.top, include_possible=args.include_possible)
     if args.prompt_pack:
         directory = Path(args.prompt_pack)
         directory.mkdir(parents=True, exist_ok=True)
@@ -266,6 +266,8 @@ def main(argv=None) -> int:
         sp.add_argument("--assumptions")
         sp.add_argument("--adapter")
         if name == "worklist":
+            sp.add_argument("--include-possible", action="store_true",
+                            help="also rank effect-capable blockers on POSSIBLE VIOLATION endpoints")
             sp.add_argument("--format", choices=["text", "json"], default="text")
             sp.add_argument("--out")
             sp.add_argument("--top", type=int, default=25)
