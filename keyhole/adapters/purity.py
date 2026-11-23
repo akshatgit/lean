@@ -661,6 +661,58 @@ class Purity:
                     declared = True
         return declared
 
+    def scalar_primary_key(self, ctx, entity):
+        """Resolve an explicit single-column primary key on a repository model."""
+        ident = self.identity(ctx, entity)
+        if not ident or ident[0] != "class":
+            return None
+        ancestors = self._ancestors(ident[1])
+        if not ancestors:
+            return None
+        keys = set()
+        declarations = set()
+        repeated = set()
+        for cls in ancestors:
+            module, node = self.class_defs[cls]
+            for item in node.body:
+                if not isinstance(item, (ast.Assign, ast.AnnAssign)):
+                    continue
+                targets = item.targets if isinstance(item, ast.Assign) else [item.target]
+                names = {t.id for t in targets if isinstance(t, ast.Name)}
+                repeated.update(names & declarations)
+                declarations.update(names)
+                if names & {"__mapper_args__", "__table__"}:
+                    return None
+                value = item.value
+                if value is None:
+                    continue
+                for call in (n for n in ast.walk(value) if isinstance(n, ast.Call)):
+                    factory = self.identity(self.module_ctx(module), call.func)
+                    if ((dotted(call.func) or "").split(".")[-1] == "PrimaryKeyConstraint"
+                            or (factory and factory[1].endswith(".PrimaryKeyConstraint"))
+                            or any(kw.arg is None for kw in call.keywords)):
+                        return None
+                    flags = [kw.value for kw in call.keywords if kw.arg == "primary_key"]
+                    if not flags:
+                        continue
+                    if not isinstance(flags[0], ast.Constant):
+                        return None
+                    if flags[0].value is False:
+                        continue
+                    if call is not value and not (
+                        isinstance(value, ast.Call) and
+                        self.identity(self.module_ctx(module), value.func) == ("ext", "sqlmodel.Field")
+                        and any(kw.arg == "sa_column" and kw.value is call for kw in value.keywords)
+                    ):
+                        return None
+                    if (flags[0].value is not True or factory not in {
+                            ("ext", "sqlmodel.Field"), ("ext", "sqlalchemy.Column"),
+                            ("ext", "sqlalchemy.orm.mapped_column")}
+                            or len(targets) != 1 or not isinstance(targets[0], ast.Name)):
+                        return None
+                    keys.add(targets[0].id)
+        return next(iter(keys)) if len(keys) == 1 and keys.isdisjoint(repeated) else None
+
     def _may_be_model_instance(self, q: str) -> bool:
         return any(self.is_model_class(cls) for cls in [q, *self._descendants(q)])
 

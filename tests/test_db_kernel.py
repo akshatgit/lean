@@ -108,6 +108,22 @@ def test_nullable_query_filters_require_a_column_on_the_selected_table(kernel, t
     }
 
 
+def test_session_get_uses_an_inherited_key_and_widens_composite_lookups(kernel):
+    assert kernel["GET /ticket/{number}"].effects[0].effect.selector == {
+        "eq": [{"field": "ticket_number"}, {"param": "number"}]
+    }
+    pair = kernel["GET /pair/{number}"]
+    assert pair.effects[0].effect.selector is True
+    assert any("primary key" in c.expression for c in pair.endpoint.unmodeled_checks)
+
+
+def test_matching_primary_key_to_caller_does_not_prove_ownership_of_other_field(kernel, tmp_path):
+    config = tmp_path / "policy.yaml"
+    config.write_text("resources:\n  Ticket:\n    confirmed: true\n    read: owner(id)\n")
+    result, = check_endpoints([kernel["GET /my-ticket"].endpoint], load_policy(config))
+    assert result.verdict == "violation"
+
+
 @pytest.mark.parametrize("allow,expected", [
     ("owner(owner_id)", "violation"),
     ("owner(owner_id) or is_null(owner_id)", "safe"),

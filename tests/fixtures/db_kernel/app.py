@@ -22,10 +22,38 @@ class Peer(SQLModel, table=True):
     owner_id: int | None
 
 
+class TicketBase(SQLModel):
+    ticket_number: int = Field(primary_key=True)
+
+
+class Ticket(TicketBase, table=True):
+    id: int
+
+
+class Pair(SQLModel, table=True):
+    id: int = Field(primary_key=True)
+    owner_id: int = Field(primary_key=True)
+
+
 def get_current_user(): ...
 
 
 def get_session(): ...
+
+
+@router.get("/ticket/{number}")
+async def ticket(number: int, session=Depends(get_session)):
+    return await session.get(Ticket, number)
+
+
+@router.get("/my-ticket")
+async def my_ticket(session=Depends(get_session), user=Depends(get_current_user)):
+    return await session.get(Ticket, user.id)
+
+
+@router.get("/pair/{number}")
+async def pair(number: int, session=Depends(get_session)):
+    return await session.get(Pair, number)
 
 
 @router.get("/shared-docs")

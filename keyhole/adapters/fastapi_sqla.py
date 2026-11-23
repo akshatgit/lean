@@ -1539,8 +1539,12 @@ class _FunctionAnalyzer:
             state = _QueryState(model, executed=True)
             self._mark_unresolved_uses(e.args[1], "row selector")
             term = self.term(e.args[1], query_model=model)
-            if term is not None:
-                state.conds.append(air.eq(air.fld("id"), term))
+            key = self.index.purity.scalar_primary_key(self._pctx(), e.args[0]) if self.index else None
+            if key and term is not None:
+                state.conds.append(air.eq(air.fld(key), term))
+            else:
+                self.ep.unmodeled_checks.append(air.UnmodeledCheck(
+                    f"primary key selector unresolved: {model}", e.lineno))
             return state
         if f.attr in ("execute", "scalars", "scalar", "exec") and recv in self.db_vars and e.args:
             state = self.query(e.args[0])
