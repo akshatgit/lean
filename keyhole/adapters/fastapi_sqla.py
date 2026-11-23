@@ -1479,7 +1479,14 @@ class _FunctionAnalyzer:
             # A filter added on one path constrains that path only.  The analysis is
             # path-sensitive and a join keeps only the conditions common to every path
             # (`_merge_states`), so it is applied here whatever the nesting.
-            for condition in e.args:
+            pending = list(reversed(e.args))
+            while pending:
+                condition = pending.pop()
+                # SQL AND implies each conjunct. Dropping an unsupported conjunct
+                # widens the selector; applying the same rule to OR would narrow it.
+                if isinstance(condition, ast.BinOp) and isinstance(condition.op, ast.BitAnd):
+                    pending.extend((condition.right, condition.left))
+                    continue
                 try:
                     state.conds.append(self.cond(condition, query_model=state.model))
                 except _Unsupported:

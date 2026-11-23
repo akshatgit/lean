@@ -90,6 +90,15 @@ async def builder_all(doc_id: int, session=Depends(get_session), user=Depends(ge
 
 # ---------------------------------------------------------------- filters added on one path
 
+@router.get("/conditional/partial-sql-and")
+async def partial_sql_and(session=Depends(get_session), user=Depends(get_current_user)):
+    return (await session.exec(select(Doc).where((Doc.id > 0) & (Doc.owner_id == user.id)))).all()
+
+
+@router.get("/conditional/partial-sql-or")
+async def partial_sql_or(session=Depends(get_session), user=Depends(get_current_user)):
+    return (await session.exec(select(Doc).where((Doc.id > 0) | (Doc.owner_id == user.id)))).all()
+
 @router.get("/conditional/python-and")
 async def python_and(q: str, session=Depends(get_session), user=Depends(get_current_user)):
     stmt = select(Doc).where((Doc.title == q) and (Doc.owner_id == user.id))
