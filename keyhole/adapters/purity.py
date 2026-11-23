@@ -1355,6 +1355,13 @@ class Purity:
         if not isinstance(func, ast.Attribute):
             return False, False
         attr = func.attr
+        # AnyIO's concrete Path wraps pathlib.Path; exists() dispatches that
+        # path's filesystem probe in a worker thread. Keep the trust decision
+        # local to this operation on a directly constructed receiver.
+        if (attr == "exists" and not call.args and not call.keywords
+                and isinstance(func.value, ast.Call)
+                and self.identity(ctx, func.value.func) == ("ext", "anyio.Path")):
+            return True, True
         if (isinstance(func.value, ast.Call) and not func.value.args and ctx.owner
                 and self.identity(ctx, func.value.func) == ("builtin", "super")):
             # super().m(...): dispatches within the owner's hierarchy (siblings included)
@@ -1452,6 +1459,8 @@ class Purity:
         return self._kw_guard(ctx, call, allow_splat=name == "dict")
 
     def _ext_free(self, ctx: _Ctx, name: str, call: ast.Call) -> bool:
+        if name == "anyio.Path":
+            return not call.keywords and self._kw_guard(ctx, call)
         if name in ("asyncio.to_thread", "anyio.to_thread.run_sync"):
             return bool(call.args) and self.callable_ref_free(ctx, call.args[0]) and self._kw_guard(ctx, call)
         if name in EXT_NOT_FREE:

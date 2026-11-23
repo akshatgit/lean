@@ -45,6 +45,11 @@ def effect_opaque(res):
     return [o for o in res.endpoint.opaque if o.may_have_effects]
 
 
+def test_filesystem_probe_requires_resolved_anyio_constructor(pure):
+    assert pure["GET /asset-exists"].verdict == "no_effects"
+    assert effect_opaque(pure["GET /other-exists"])
+
+
 # ---- the five known walker-skip endpoints (mirrored) -------------------------------------
 
 # Move 2 changed the contract for these positions: a call in an `if` test, a BoolOp, a

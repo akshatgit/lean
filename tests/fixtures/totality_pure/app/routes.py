@@ -1,11 +1,22 @@
 """Every call besides the owner-checked load is PROVABLY unable to touch the database,
 by import identity, receiver type, or transitive closure.  These routes must be SAFE."""
+import anyio
 from fastapi import APIRouter, Depends, HTTPException
 
 from .lib import Formatter, describe, even_helper, get_current_user, get_session, logger, slugify
 from .models import Doc, DocOut
 
 router = APIRouter()
+
+
+@router.get("/asset-exists")
+async def asset_exists(name: str):
+    return await anyio.Path(name).exists()
+
+
+@router.get("/other-exists")
+async def other_exists(service=Depends(get_session)):
+    return await service.Path("asset").exists()
 
 
 @router.get("/pure/{doc_id}")
