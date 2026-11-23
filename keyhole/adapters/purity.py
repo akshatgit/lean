@@ -1350,6 +1350,8 @@ class Purity:
         if ident is None:
             return False
         kind, name = ident
+        if kind == "ext" and name == "uuid.uuid4":
+            return True
         if kind == "builtin":
             return name in BUILTIN_VALUE_TYPES
         if kind == "func":

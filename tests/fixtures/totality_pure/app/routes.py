@@ -9,11 +9,16 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
 
 from .lib import Formatter, describe, even_helper, get_current_user, get_session, logger, slugify
-from .models import Doc, DocOut
+from .models import Doc, DocOut, Receipt
 
 router = APIRouter()
 
 ASSET = Path("asset.bin")
+
+
+@router.get("/receipt")
+def receipt():
+    return Receipt()
 
 
 @router.get("/process-locks")

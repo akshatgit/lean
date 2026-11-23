@@ -45,6 +45,10 @@ def effect_opaque(res):
     return [o for o in res.endpoint.opaque if o.may_have_effects]
 
 
+def test_uuid_default_factory_is_effect_free(pure):
+    assert pure["GET /receipt"].verdict == "no_effects"
+
+
 def test_process_lock_allocation_requires_stdlib_identity(pure):
     assert pure["GET /process-locks"].verdict == "no_effects"
     assert effect_opaque(pure["GET /plugin-lock"])
