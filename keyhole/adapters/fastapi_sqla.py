@@ -628,6 +628,22 @@ class FastAPISQLAlchemyAdapter:
                     yield method, path, auth
 
 
+def _dnf_terms(pred, limit):
+    """Count disjuncts without constructing the expanded predicate."""
+    if isinstance(pred, bool):
+        return int(pred)
+    if "and" in pred:
+        count = 1
+        for child in pred["and"]:
+            count *= _dnf_terms(child, limit)
+            if count > limit:
+                break
+        return count
+    if "or" in pred:
+        return sum(_dnf_terms(child, limit) for child in pred["or"])
+    return 1
+
+
 class _Unsupported(Exception):
     pass
 
@@ -1092,6 +1108,28 @@ class _FunctionAnalyzer:
             return []
         return [item for item in lists[0] if all(item in other for other in lists[1:])]
 
+    def _merge_query_filters(self, variants):
+        """Rows reachable on any branch; factor shared clauses before the union."""
+        filters = [q.conds for q in variants]
+        common = self._common_lists(filters)
+        alternatives = []
+        for clauses in filters:
+            remainder = air.and_(*(p for p in clauses if p not in common))
+            if remainder is True:
+                return common  # one path has no further restriction
+            if remainder not in alternatives:
+                alternatives.append(remainder)
+        union = air.or_(*alternatives)
+        # Independent branch choices multiply when Lean converts the selector
+        # to DNF. Widen a costly new choice and record the lost filter so any
+        # counterexample depending on it remains a lead.
+        if _dnf_terms(air.and_(*common, union), 256) > 256:
+            note = air.UnmodeledCheck("branch query filters widened at DNF limit", self.fn.lineno)
+            if note not in self.ep.unmodeled_checks:
+                self.ep.unmodeled_checks.append(note)
+            return common
+        return [*common, union]
+
     def _merge_row_bindings(self, bindings: list[dict]) -> dict:
         first = copy.deepcopy(bindings[0])
         if len(bindings) == 1:
@@ -1161,7 +1199,7 @@ class _FunctionAnalyzer:
             item = copy.deepcopy(variants[0])
             if all(variant.model == item.model and variant.terminal == item.terminal
                    for variant in variants):
-                item.conds = self._common_lists([variant.conds for variant in variants])
+                item.conds = self._merge_query_filters(variants)
                 item.executed = all(variant.executed for variant in variants)
                 item.effect_emitted = all(variant.effect_emitted for variant in variants)
                 merged.queries[name] = item
@@ -1172,7 +1210,7 @@ class _FunctionAnalyzer:
             variants = [state.query_results[name] for state in states if name in state.query_results]
             item = copy.deepcopy(variants[0])
             if all(variant.model == item.model for variant in variants):
-                item.conds = self._common_lists([variant.conds for variant in variants])
+                item.conds = self._merge_query_filters(variants)
                 merged.query_results[name] = item
 
         value_names = set.intersection(*(set(state.values) for state in states)) if states else set()
@@ -1215,7 +1253,7 @@ class _FunctionAnalyzer:
 
     def _finalize_returned_query(self):
         """A statement-builder helper: every return hands back an unexecuted statement
-        for the same model and kind.  Its conditions are those common to all returns.
+        for the same model and kind. Its selector covers the rows from any return.
         Only then are the builder calls accounted for (the caller receives the
         statement); otherwise they stay unvisited for the totality sweep."""
         queries = self.returned_queries
@@ -1225,7 +1263,7 @@ class _FunctionAnalyzer:
         if any(q.model != first.model or q.terminal != first.terminal for q in queries):
             return
         self.returned_query = _QueryState(
-            first.model, self._common_lists([q.conds for q in queries]), first.terminal)
+            first.model, self._merge_query_filters(queries), first.terminal)
         for spine in self._returned_query_spines:
             self._visited.update(spine)
 
@@ -1568,7 +1606,7 @@ class _FunctionAnalyzer:
             return None       # no table yet: nothing below can be interpreted
         if f.attr in ("filter", "where"):
             # A filter added on one path constrains that path only.  The analysis is
-            # path-sensitive and a join keeps only the conditions common to every path
+            # path-sensitive and a join covers the rows selected on any path
             # (`_merge_states`), so it is applied here whatever the nesting.
             pending = list(reversed(e.args))
             while pending:

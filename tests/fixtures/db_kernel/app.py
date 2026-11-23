@@ -139,6 +139,15 @@ async def builder_all(doc_id: int, session=Depends(get_session), user=Depends(ge
 
 # ---------------------------------------------------------------- filters added on one path
 
+@router.get("/conditional/owned-or-shared")
+async def owned_or_shared(shared: bool, session=Depends(get_session), user=Depends(get_current_user)):
+    stmt = select(Doc)
+    if shared:
+        stmt = stmt.where(Doc.owner_id.is_(None))
+    else:
+        stmt = stmt.where(Doc.owner_id == user.id)
+    return (await session.exec(stmt)).all()
+
 @router.get("/optional-checked/{doc_id}")
 async def optional_checked(doc_id: int, skip: bool, session=Depends(get_session), user=Depends(get_current_user)):
     if skip:

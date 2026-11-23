@@ -117,6 +117,32 @@ def test_session_get_uses_an_inherited_key_and_widens_composite_lookups(kernel):
     assert any("primary key" in c.expression for c in pair.endpoint.unmodeled_checks)
 
 
+def test_branch_specific_filters_preserve_owned_or_shared_rows(kernel, tmp_path):
+    res = kernel["GET /conditional/owned-or-shared"]
+    assert res.verdict in {"possible_violation", "violation"}  # owner-only policy
+    config = tmp_path / "shared.yaml"
+    template = (FIXTURE / "keyhole.policy.yaml").read_text()
+    config.write_text(template.replace("read: owner(owner_id)", "read: owner(owner_id) or is_null(owner_id)"))
+    checked, = check_endpoints([res.endpoint], load_policy(config))
+    assert checked.verdict == "safe"
+
+
+def test_many_independent_filter_choices_widen_with_review_note(tmp_path):
+    source = (FIXTURE / "app.py").read_text()
+    choices = "".join(
+        f"    if flags[{i}]:\n        stmt = stmt.where(Doc.title == 'a{i}')\n"
+        f"    else:\n        stmt = stmt.where(Doc.title == 'b{i}')\n"
+        for i in range(10)
+    )
+    (tmp_path / "app.py").write_text(source + '\n@router.get("/many-choices")\n'
+        'async def many_choices(flags: list, session=Depends(get_session)):\n'
+        '    stmt = select(Doc)\n' + choices + '    return (await session.exec(stmt)).all()\n')
+    policy = load_policy(FIXTURE / "keyhole.policy.yaml")
+    endpoints = FastAPISQLAlchemyAdapter().extract(tmp_path, {}, policy=policy)
+    endpoint = next(ep for ep in endpoints if ep.path == "/many-choices")
+    assert any("DNF limit" in check.expression for check in endpoint.unmodeled_checks)
+
+
 def test_matching_primary_key_to_caller_does_not_prove_ownership_of_other_field(kernel, tmp_path):
     config = tmp_path / "policy.yaml"
     config.write_text("resources:\n  Ticket:\n    confirmed: true\n    read: owner(id)\n")
