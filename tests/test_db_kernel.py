@@ -45,6 +45,7 @@ POSITIVE = [
 ]
 
 NEGATIVE = [
+    ("GET /conditional/converted-owner", "read"),
     ("POST /write/create-owner-first", "create"),
     ("GET /conditional/local-and", "read"),
     ("GET /conditional/local-col", "read"),
@@ -98,6 +99,12 @@ def test_deep_read_is_displayed_under_direct_helper(kernel):
     assert "_level1_checked" in trace
     assert "1 modeled effects" in trace
     assert "read Doc" in trace
+
+
+def test_filter_conversion_requires_a_known_result(kernel):
+    known = kernel["GET /conditional/converted-literal"].effects[0].effect
+    assert known.selector == {"eq": [{"field": "id"}, {"const": "7"}]}
+    assert kernel["GET /conditional/shadowed-conversion"].effects[0].effect.selector is True
 
 
 def test_nullable_query_filters_require_a_column_on_the_selected_table(kernel, tmp_path):

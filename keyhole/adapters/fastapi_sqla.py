@@ -1479,9 +1479,19 @@ class _FunctionAnalyzer:
                 return _FieldTerm(e.attr, base)
         if isinstance(e, ast.Call) and self._sql_wrapper(e) == "col" and len(e.args) == 1:
             return self.term(e.args[0], query_model=query_model)
-        if (isinstance(e, ast.Call) and _dotted(e.func) in ("str", "int", "UUID", "uuid.UUID")
-                and len(e.args) == 1):
-            return self.term(e.args[0], query_model=query_model)
+        # AIR has no conversion operator. A conversion can change an identifier
+        # (e.g. int("007")), even when the callee really is the named builtin.
+        if (self.index and isinstance(e, ast.Call) and len(e.args) == 1 and not e.keywords
+                and isinstance(e.args[0], ast.Constant) and type(e.args[0].value) in (str, int, bool)):
+            identity = self.index.purity.identity(self._pctx(), e.func)
+            literal = e.args[0].value
+            if identity == ("builtin", "str"):
+                return air.const(str(literal))
+            if identity == ("builtin", "int"):
+                try:
+                    return air.const(int(literal))
+                except ValueError:
+                    return None
         return None
 
     def _sql_wrapper(self, call):

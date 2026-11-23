@@ -226,6 +226,24 @@ async def local_col(session=Depends(get_session), user=Depends(get_current_user)
     return (await session.exec(stmt)).all()
 
 
+@router.get("/conditional/converted-owner")
+async def converted_owner(session=Depends(get_session), user=Depends(get_current_user)):
+    return (await session.exec(select(Doc).where(Doc.owner_id == int(user.id)))).all()
+
+
+@router.get("/conditional/converted-literal")
+async def converted_literal(session=Depends(get_session)):
+    return (await session.exec(select(Doc).where(Doc.id == int("007")))).all()
+
+
+@router.get("/conditional/shadowed-conversion")
+async def shadowed_conversion(session=Depends(get_session)):
+    def int(value):
+        return 17
+
+    return (await session.exec(select(Doc).where(Doc.id == int("007")))).all()
+
+
 @router.get("/conditional/partial-sql-or")
 async def partial_sql_or(session=Depends(get_session), user=Depends(get_current_user)):
     return (await session.exec(select(Doc).where((Doc.id > 0) | (Doc.owner_id == user.id)))).all()
