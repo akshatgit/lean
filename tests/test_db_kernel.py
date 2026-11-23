@@ -27,6 +27,7 @@ def kernel():
 
 
 POSITIVE = [
+    "GET /inline-owned-projection",
     "GET /conditional/rebound-principal-exits",
     "POST /write/create-owner-last",
     "GET /conditional/imported-and",
@@ -46,6 +47,7 @@ POSITIVE = [
 ]
 
 NEGATIVE = [
+    ("GET /inline-unscoped-projection", "read"),
     ("GET /conditional/rebound-principal", "read"),
     ("GET /conditional/converted-owner", "read"),
     ("POST /write/create-owner-first", "create"),

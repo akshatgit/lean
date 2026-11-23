@@ -126,7 +126,7 @@ def test_modeled_part_of_a_skip_endpoint_is_still_proven(skips):
 @pytest.mark.parametrize("key", [
     "GET /skip/if-test/{flow_id}", "GET /skip/ifexp/{flow_id}", "GET /skip/subscript/{flow_id}",
     "GET /skip/for-iter", "GET /skip/kwarg/{flow_id}", "GET /skip/fstring/{flow_id}",
-    "GET /skip/raise/{flow_id}",
+    "GET /skip/raise/{flow_id}", "GET /skip/comprehension",
 ])
 def test_unguarded_access_in_an_expression_position_is_a_violation(skips, key):
     res = skips[key]
@@ -134,10 +134,10 @@ def test_unguarded_access_in_an_expression_position_is_a_violation(skips, key):
     assert any(e.effect.resource == "Flow" and e.verdict == "violation" for e in res.effects)
 
 
-# Separate scopes (comprehension, lambda, nested function), a handle the adapter cannot
+# Separate scopes (lambda, nested function), a handle the adapter cannot
 # identify, and an unreadable dependency are still not modeled: they must stay UNKNOWN.
 @pytest.mark.parametrize("key", [
-    "GET /skip/comprehension", "GET /skip/with-item", "DELETE /skip/closure/{flow_id}",
+    "GET /skip/with-item", "DELETE /skip/closure/{flow_id}",
     "GET /skip/lambda/{flow_id}", "GET /skip/unresolved-dependency/{flow_id}",
 ])
 def test_unmodeled_scope_is_unknown(skips, key):

@@ -60,6 +60,17 @@ async def owned_projection(session: AsyncSession = Depends(get_session), user=De
     return [row.metadata_fields.get("title") for row in rows]
 
 
+@router.get("/inline-owned-projection")
+async def inline_owned_projection(session=Depends(get_session), user=Depends(get_current_user)):
+    stmt = select(Doc).where(Doc.owner_id == user.id)
+    return [row.id for row in (await session.exec(stmt)).all()]
+
+
+@router.get("/inline-unscoped-projection")
+async def inline_unscoped_projection(session=Depends(get_session), user=Depends(get_current_user)):
+    return [row.id for row in (await session.exec(select(Doc))).all()]
+
+
 @router.get("/mixed-projection")
 async def mixed_projection(extra, session: AsyncSession = Depends(get_session), user=Depends(get_current_user)):
     rows = (await session.exec(select(Doc).where(Doc.owner_id == user.id))).all()

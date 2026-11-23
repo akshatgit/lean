@@ -1846,12 +1846,24 @@ class _FunctionAnalyzer:
         bound to anything: only its effects and opaques are recorded, with the current
         path guards.  Emitting it even if short-circuiting would skip it over-approximates.
 
-        Lambdas, comprehensions and nested functions are separate scopes that run later
-        or repeatedly with their own bindings; they are left to the totality sweep."""
+        The first iterable of a comprehension is evaluated in the enclosing scope.
+        Its query can use the current bindings. Calls under the iteration variable
+        and in nested functions are left to the totality sweep."""
         todo = [e for e in exprs if e is not None]
         calls = []
         while todo:
             node = todo.pop(0)
+            if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                source = node.generators[0].iter
+                if isinstance(source, ast.Await):
+                    source = source.value
+                if (isinstance(source, ast.Call) and id(source) not in self._visited
+                        and any(isinstance(n.func, ast.Attribute) and _dotted(n.func.value) in self.db_vars
+                                and n.func.attr in {"exec", "execute", "scalars"} for n in self._spine(source))):
+                    query = self.query(source)
+                    if query and query.executed:
+                        self._record_executed_query(source, query, source.lineno)
+                continue
             if isinstance(node, self._NESTED_SCOPES):
                 continue
             if isinstance(node, ast.Call):
@@ -3026,12 +3038,15 @@ class _FunctionAnalyzer:
                 if q.executed:
                     # Only an EXECUTED query is accounted for.  A statement that is
                     # merely built here stays unvisited and is caught by the sweep.
-                    self._mark_spine(e)
-                if q.executed and not q.effect_emitted:
-                    self._emit(q.terminal or "read", q.model, air.and_(*q.conds),
-                               list(self.global_guards), line)
+                    self._record_executed_query(e, q, line)
             elif _dotted(e.func) not in self.models:
                 self._helper("_ret", e, line)
+
+    def _record_executed_query(self, call, query, line):
+        self._mark_spine(call)
+        if not query.effect_emitted:
+            self._emit(query.terminal or "read", query.model, air.and_(*query.conds),
+                       list(self.global_guards), line)
 
     def _emit(self, kind, model, selector, guards, line, assumed_from=None):
         effect = air.Effect(
