@@ -1368,13 +1368,22 @@ class _FunctionAnalyzer:
         """Predicate that holds when `if e: raise` does NOT raise."""
         if isinstance(e, ast.Compare) and len(e.ops) == 1:
             op, rhs = e.ops[0], e.comparators[0]
+            if isinstance(op, ast.IsNot) and isinstance(rhs, ast.Constant) and rhs.value is None:
+                return self._null_guard(e.left)
             if isinstance(op, ast.NotEq):
                 a, b = self.term(e.left), self.term(rhs)
                 if a is None or b is None:
                     raise _Unsupported("guard term")
                 return air.eq(a, b)
             if isinstance(op, ast.Is) and isinstance(rhs, ast.Constant) and rhs.value is None:
-                return True
+                subject = e.left.value if isinstance(e.left, ast.Await) else e.left
+                if isinstance(subject, ast.Name) and subject.id in self.rows:
+                    return True
+                if (isinstance(subject, ast.Call) and isinstance(subject.func, ast.Attribute)
+                        and subject.func.attr == "get" and _dotted(subject.func.value) in self.db_vars
+                        and subject.args and self._model_of(subject.args[0])):
+                    return True  # a successful row lookup entails existence
+                raise _Unsupported("non-null value guard")
             raise _Unsupported("guard comparison")
         if isinstance(e, ast.BoolOp):
             parts = [self.neg(v) for v in e.values]
@@ -1388,8 +1397,16 @@ class _FunctionAnalyzer:
             return air.eq(t, air.const("false"))
         raise _Unsupported("guard")
 
+    def _null_guard(self, expr):
+        if isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name) and expr.value.id in self.rows:
+            return air.eq(self.term(expr), air.const(None))
+        raise _Unsupported("null guard on untracked value")
+
     def pos(self, e):
         """Predicate that holds when `e` is truthy."""
+        if (isinstance(e, ast.Compare) and len(e.ops) == 1 and isinstance(e.ops[0], ast.Is)
+                and isinstance(e.comparators[0], ast.Constant) and e.comparators[0].value is None):
+            return self._null_guard(e.left)
         if isinstance(e, ast.Compare) and len(e.ops) == 1 and isinstance(e.ops[0], ast.Eq):
             return self.cond(e)
         if isinstance(e, ast.BoolOp):

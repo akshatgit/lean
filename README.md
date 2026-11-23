@@ -131,6 +131,10 @@ the human-readable result is [`langflow-claude-policy-docker-report.html`](langf
 and the assumptions/counts/manual triage are documented in
 [`langflow-claude-policy-triage.md`](langflow-claude-policy-triage.md).
 
+For resources where an unowned row is shared, use
+`owner(owner_id) or is_null(owner_id)`. The latter matches a null field value.
+Quoted strings such as `'None'` are ordinary string values.
+
 ## Supported FastAPI/SQLAlchemy patterns (MVP)
 
 | Pattern | Example |

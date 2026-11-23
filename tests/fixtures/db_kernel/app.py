@@ -90,6 +90,13 @@ async def builder_all(doc_id: int, session=Depends(get_session), user=Depends(ge
 
 # ---------------------------------------------------------------- filters added on one path
 
+@router.get("/nullable-owner/{doc_id}")
+async def nullable_owner(doc_id: int, session=Depends(get_session), user=Depends(get_current_user)):
+    doc = await session.get(Doc, doc_id)
+    if doc is None or (doc.owner_id is not None and doc.owner_id != user.id):
+        raise HTTPException(status_code=404)
+    return doc
+
 @router.get("/conditional/partial-sql-and")
 async def partial_sql_and(session=Depends(get_session), user=Depends(get_current_user)):
     return (await session.exec(select(Doc).where((Doc.id > 0) & (Doc.owner_id == user.id)))).all()

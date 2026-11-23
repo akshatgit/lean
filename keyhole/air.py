@@ -37,6 +37,8 @@ def fld(name: str) -> Term:
 
 
 def const(value: Any) -> Term:
+    if value is None:
+        return {"const": None}
     if isinstance(value, bool):
         value = "true" if value else "false"
     return {"const": str(value)}

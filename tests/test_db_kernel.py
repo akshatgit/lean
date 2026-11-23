@@ -5,6 +5,7 @@ the code (must be SAFE) and a negative twin where it is not (must be a violation
 lead, never green).  A capability that only had the positive half could be producing
 SAFE for the wrong reason.
 """
+import json
 from pathlib import Path
 
 import pytest
@@ -89,6 +90,23 @@ def test_deep_read_is_displayed_under_direct_helper(kernel):
     assert "_level1_checked" in trace
     assert "1 modeled effects" in trace
     assert "read Doc" in trace
+
+
+@pytest.mark.parametrize("allow,expected", [
+    ("owner(owner_id)", "violation"),
+    ("owner(owner_id) or is_null(owner_id)", "safe"),
+    ("owner(owner_id) or owner_id == 'n:'", "violation"),
+    ("owner(owner_id) or owner_id == 'None'", "violation"),
+])
+def test_nullable_ownership_guard_is_checked_against_policy(kernel, tmp_path, allow, expected):
+    endpoint = kernel["GET /nullable-owner/{doc_id}"].endpoint
+    config = tmp_path / "policy.yaml"
+    template = (FIXTURE / "keyhole.policy.yaml").read_text()
+    config.write_text(template.replace("read: owner(owner_id)", "read: " + json.dumps(allow)))
+    result, = check_endpoints([endpoint], load_policy(config))
+    assert result.verdict == expected
+    if expected == "violation":
+        assert [{"field": "owner_id"}, None] in result.effects[0].witness["values"]
 
 
 def test_owner_filter_reaches_the_effect_through_the_parametric_helper(kernel):

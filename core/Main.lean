@@ -21,7 +21,10 @@ def parseTerm (j : Json) : Except String Keyhole.Term := do
   if let .ok v := j.getObjValAs? String "param" then return .param v
   if let .ok v := j.getObjValAs? String "principal" then return .principal v
   if let .ok v := j.getObjValAs? String "field" then return .field v
-  if let .ok v := j.getObjValAs? String "const" then return .const v
+  -- Reserve a value for null while preserving strings even in the reserved namespace.
+  if let .ok v := j.getObjValAs? String "const" then
+    return .const (if v.startsWith "n:" then "n:" ++ v else v)
+  if let .ok Json.null := j.getObjVal? "const" then return .const "n:"
   throw s!"bad term: {j.compress}"
 
 partial def parsePred (j : Json) : Except String Pred := do
@@ -66,11 +69,16 @@ def parseEffect (j : Json) : Except String (String × Effect) := do
                 selector := ← parsePred (← j.getObjVal? "selector"),
                 guards := guards })
 
+def valueJson (v : String) : Json :=
+  if v == "n:" then Json.null
+  else if v.startsWith "n:n:" then Json.str (v.drop 2)
+  else Json.str v
+
 def termJson : Keyhole.Term → Json
   | .param n => Json.mkObj [("param", n)]
   | .principal a => Json.mkObj [("principal", a)]
   | .field f => Json.mkObj [("field", f)]
-  | .const v => Json.mkObj [("const", v)]
+  | .const v => Json.mkObj [("const", valueJson v)]
 
 def verdictJson (id : String) : Verdict → Json
   | .safe => Json.mkObj [("id", id), ("verdict", "safe")]
@@ -79,9 +87,9 @@ def verdictJson (id : String) : Verdict → Json
       ("id", id), ("verdict", "violation"),
       ("witness", Json.mkObj [
         ("values", Json.arr (w.vals.toArray.map fun (t, v) =>
-          Json.arr #[termJson t, Json.str v])),
+          Json.arr #[termJson t, valueJson v])),
         ("facts", Json.arr (w.facts.toArray.map fun (r, a, b) =>
-          Json.arr #[Json.str r, Json.str a, Json.str b]))])]
+          Json.arr #[Json.str r, valueJson a, valueJson b]))])]
 
 def run (input : String) : Except String Json := do
   let j ← Json.parse input

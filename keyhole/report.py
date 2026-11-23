@@ -127,7 +127,8 @@ def _pretty_values(witness: dict) -> dict:
         (kind, name), = term.items()
         if kind == "const":
             continue
-        out[kind][name] = re.sub(r"#w(\d+|\?)", r"<v\1>", value) if value.startswith("#") else repr(value)
+        out[kind][name] = (re.sub(r"#w(\d+|\?)", r"<v\1>", value)
+                           if isinstance(value, str) and value.startswith("#") else repr(value))
     return out
 
 

@@ -109,10 +109,12 @@ class _Parser:
             return True
         if tok == "false":
             return False
-        if tok in ("owner", "member") and self.peek() == "(":
+        if tok in ("owner", "member", "is_null") and self.peek() == "(":
             self.take("(")
             f = self.take()
             self.take(")")
+            if tok == "is_null":
+                return air.eq(air.fld(f), air.const(None))
             if tok == "owner":
                 return air.eq(air.fld(f), air.principal(self.id_attr))
             return air.member("member", air.principal(self.id_attr), air.fld(f))
