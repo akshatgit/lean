@@ -1,5 +1,7 @@
 # Keyhole: handoff notes
 
+**Current handoff for the Langflow work on `review-fixes`, November 22, 2026:** [Verified results, reproduction commands, and open decisions](docs/langflow-handoff.md). The notes below are historical. The current scanner implements seven verdicts.
+
 Context for continuing this project in a new Claude session. Read this first, then the README and the design doc.
 
 - Repo: https://github.com/akshatgit/lean (package `keyhole`; final name undecided, "Warrant" was the front-runner)
