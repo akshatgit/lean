@@ -45,6 +45,11 @@ def effect_opaque(res):
     return [o for o in res.endpoint.opaque if o.may_have_effects]
 
 
+def test_process_lock_allocation_requires_stdlib_identity(pure):
+    assert pure["GET /process-locks"].verdict == "no_effects"
+    assert effect_opaque(pure["GET /plugin-lock"])
+
+
 def test_dataclass_slot_store_requires_a_known_slot_on_self(pure):
     assert pure["GET /snapshot"].verdict == "no_effects"
     assert effect_opaque(pure["GET /write-unknown"])

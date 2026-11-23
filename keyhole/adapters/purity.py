@@ -1576,6 +1576,8 @@ class Purity:
         return self._kw_guard(ctx, call, allow_splat=name == "dict")
 
     def _ext_free(self, ctx: _Ctx, name: str, call: ast.Call) -> bool:
+        if name in {"threading.Lock", "threading.RLock"}:
+            return not call.args and not call.keywords
         if name == "anyio.Path":
             return not call.keywords and self._kw_guard(ctx, call)
         if name in ("asyncio.to_thread", "anyio.to_thread.run_sync"):

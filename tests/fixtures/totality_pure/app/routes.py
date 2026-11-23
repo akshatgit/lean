@@ -1,6 +1,8 @@
 """Every call besides the owner-checked load is PROVABLY unable to touch the database,
 by import identity, receiver type, or transitive closure.  These routes must be SAFE."""
 import anyio
+import threading
+from threading import RLock as reentrant_lock
 from asyncio import to_thread
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +14,16 @@ from .models import Doc, DocOut
 router = APIRouter()
 
 ASSET = Path("asset.bin")
+
+
+@router.get("/process-locks")
+def process_locks():
+    return bool((threading.Lock(), reentrant_lock()))
+
+
+@router.get("/plugin-lock")
+def plugin_lock(threading):
+    return threading.Lock()
 
 
 @dataclass(frozen=True, slots=True)
