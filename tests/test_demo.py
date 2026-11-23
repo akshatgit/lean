@@ -121,6 +121,12 @@ def test_html_report_is_human_readable_and_filterable(results):
     assert 'id="filter-verdict"' in page
     assert 'id="filter-resource"' in page
     assert 'id="filter-review"' in page
+    counts = json.loads(report.stats_report(list(results.values())))["modeled_accesses"]
+    for state, number in counts["endpoints_by_access_state"].items():
+        assert page.count(f'data-accesses="{state}"') == number
+    assert sum(counts["endpoints_by_access_state"].values()) == len(EXPECTED)
+    assert counts["total"] == sum(len(r.endpoint.effects) for r in results.values())
+    assert counts["by_verdict"]["safe"] > 0
     assert "Rows touched when" in page
     assert "Policy allows when" in page
     assert "GET /api/v1/documents/{doc_id}" in page

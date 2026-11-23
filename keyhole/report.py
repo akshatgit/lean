@@ -263,7 +263,7 @@ _HTML_STYLE = """
     top: 0;
     z-index: 5;
     display: grid;
-    grid-template-columns: minmax(220px, 2fr) repeat(3, minmax(145px, 1fr));
+    grid-template-columns: minmax(180px, 2fr) repeat(4, minmax(120px, 1fr));
     gap: 10px;
     padding: 13px;
     border: 1px solid var(--line);
@@ -356,6 +356,7 @@ _HTML_SCRIPT = """
   const verdict = document.querySelector('#filter-verdict');
   const resource = document.querySelector('#filter-resource');
   const review = document.querySelector('#filter-review');
+  const accesses = document.querySelector('#filter-accesses');
   const count = document.querySelector('#result-count');
 
   function applyFilters() {
@@ -365,14 +366,15 @@ _HTML_SCRIPT = """
       const visible = (!q || card.dataset.search.includes(q))
         && (!verdict.value || card.dataset.verdict === verdict.value)
         && (!resource.value || card.dataset.resources.split('|').includes(resource.value))
-        && (!review.value || card.dataset.review === review.value);
+        && (!review.value || card.dataset.review === review.value)
+        && (!accesses.value || card.dataset.accesses === accesses.value);
       card.hidden = !visible;
       if (visible) shown += 1;
     }
     count.textContent = `${shown} of ${cards.length} endpoints shown`;
   }
 
-  for (const control of [search, verdict, resource, review]) {
+  for (const control of [search, verdict, resource, review, accesses]) {
     control.addEventListener(control === search ? 'input' : 'change', applyFilters);
   }
   applyFilters();
@@ -444,6 +446,24 @@ def _html_helper_trace(res):
     return "<h3>Helper trace</h3>" + "".join(groups) if groups else ""
 
 
+def _access_state(res):
+    if not res.effects:
+        return "none"
+    if all(er.verdict == "safe" for er in res.effects):
+        return "all_proved"
+    return "unproved"
+
+
+def _access_stats(results):
+    verdicts = Counter(er.verdict for res in results for er in res.effects)
+    states = Counter(_access_state(res) for res in results)
+    return {
+        "total": sum(verdicts.values()),
+        "by_verdict": dict(sorted(verdicts.items())),
+        "endpoints_by_access_state": {key: states[key] for key in ("none", "all_proved", "unproved")},
+    }
+
+
 def _html_finding(res, policy) -> str:
     ep = res.endpoint
     label, status_key = _display_status(res)
@@ -490,7 +510,7 @@ def _html_finding(res, policy) -> str:
     return (
         f'<details class="finding {_h(status_key)}" data-verdict="{_h(status_key)}" '
         f'data-resources="{_h("|".join(resources))}" data-review="{review_value}" '
-        f'data-search="{_h(searchable)}">'
+        f'data-accesses="{_access_state(res)}" data-search="{_h(searchable)}">'
         "<summary>"
         f'<span class="status">{_h(label)}</span>'
         f'<span class="endpoint">{_h(ep.key)}</span>'
@@ -516,7 +536,8 @@ def html_report(results, policy, title: str = "Keyhole security report") -> str:
         ),
     )
     raw_counts = {key: sum(r.verdict == key for r in results) for key in LABEL}
-    no_effects = sum(not r.endpoint.effects for r in results)
+    accesses = _access_stats(results)
+    states = accesses["endpoints_by_access_state"]
     incomplete = sum(any(o.may_have_effects for o in r.endpoint.opaque) for r in results)
     proof_complete = sum(
         bool(r.endpoint.effects) and r.verdict == "safe" for r in results
@@ -533,7 +554,9 @@ def html_report(results, policy, title: str = "Keyhole security report") -> str:
         (raw_counts["possible_violation"], "Possible violations"),
         (raw_counts["unknown"], "Unknown"),
         (proof_complete, "Proof-complete"),
-        (no_effects, "Endpoints with zero extracted accesses"),
+        (f'{accesses["by_verdict"].get("safe", 0)} / {accesses["total"]}', "Modeled accesses proved under the supplied policy"),
+        (states["all_proved"], "Endpoints with every modeled access proved"),
+        (states["none"], "Endpoints with zero extracted accesses"),
         (incomplete, "Partial models"),
     ]
     metrics_html = "".join(
@@ -590,7 +613,10 @@ def html_report(results, policy, title: str = "Keyhole security report") -> str:
         '<option value="no_effects">No modeled effects</option></select>'
         f'<select id="filter-resource"><option value="">All resources</option>{resource_options}</select>'
         '<select id="filter-review"><option value="">All review states</option>'
-        '<option value="yes">Needs review</option><option value="no">Proof complete</option></select>'
+        '<option value="yes">Needs review</option><option value="no">No review flags</option></select>'
+        '<select id="filter-accesses" aria-label="Modeled access proofs"><option value="">All access states</option>'
+        '<option value="all_proved">Every modeled access proved</option>'
+        '<option value="unproved">Has an unproved access</option><option value="none">Zero modeled accesses</option></select>'
         '</section><p id="result-count" class="result-count"></p>'
         f'<section id="findings">{findings}</section></main>{_HTML_SCRIPT}</body></html>'
     )
@@ -661,6 +687,7 @@ def stats_report(results) -> str:
     return json.dumps({
         "endpoints": len(results),
         "verdict_counts": verdict_counts,
+        "modeled_accesses": _access_stats(results),
         "unknown_causes": {
             "by_reason": ordered(by_reason),
             "by_call": ordered(by_call),
