@@ -31,8 +31,8 @@ def _review_reasons(res) -> list[str]:
     guard_opaque = [o for o in res.endpoint.opaque if not o.may_have_effects]
     if effect_opaque:
         reasons.append(
-            f"{len(effect_opaque)} source operation(s) that may read or write data were not "
-            "modeled; the extracted effects may be incomplete."
+            f"{len(effect_opaque)} analysis records describe unmodeled operations that may "
+            "read or write data. Repeated helper paths can refer to the same operation."
         )
     if guard_opaque:
         reasons.append(
@@ -417,12 +417,13 @@ def _html_helper_trace(res):
 
     groups = []
     sites = sorted(ep.helper_sites)
-    if None in operations or None in checks:
+    if None in operations or None in checks or None in effects:
         sites.append(None)
     for site in sites:
         label = f"{site[2]} · line {site[0]}" if site else "Other endpoint or dependency evidence"
         ops = operations[site]
         capable = sum(count for key, count in ops.items() if key[4])
+        locations = {key[2] for key in ops if key[4] and key[2]}
         value_only = sum(ops.values()) - capable
         rows = []
         for er in effects[site]:
@@ -436,7 +437,8 @@ def _html_helper_trace(res):
                         f"{'effect-capable' if may_effect else 'value only'}"
                         f"{' · may block' if may_block else ''} · {_h(path)} · {_h(target or '')} × {count}</li>")
         groups.append(f"<details><summary>{_h(label)} · {len(effects[site])} modeled effects · "
-                      f"{capable} effect-capable · {value_only} value only · "
+                      f"{capable} effect-capable records ({len(locations)} distinct known source lines) · "
+                      f"{value_only} value-only records · "
                       f"{sum(checks[site].values())} dropped checks</summary>"
                       f"<ul class=\"compact\">{''.join(rows)}</ul></details>")
     return "<h3>Helper trace</h3>" + "".join(groups) if groups else ""

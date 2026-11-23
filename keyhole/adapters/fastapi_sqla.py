@@ -845,7 +845,7 @@ class _FunctionAnalyzer:
                                     decorator_list=[dec], lineno=self.fn.lineno, col_offset=0)
             if purity is not None and purity._decorators_ok(self.module, probe, self.owner_class):
                 continue
-            self._opaque(f"@{ast.unparse(target)[:80]}", "endpoint_decorator", self.fn.lineno)
+            self._opaque(f"@{ast.unparse(target)[:80]}", "endpoint_decorator", target.lineno)
 
     def _route_dependencies(self) -> list[str]:
         out = []
@@ -914,10 +914,9 @@ class _FunctionAnalyzer:
         assumption would have to name to cover it; `keyhole worklist` groups by that."""
         if any(o.call == call and o.reason == reason and o.line == line for o in self.ep.opaque):
             return
-        origin = None
+        origin = f"{self.ep.file}:{getattr(node, 'lineno', line)}"
         if node is not None and self.index is not None:
             target = target or self.index.purity.call_target(self._pctx(), node)
-            origin = f"{self.ep.file}:{getattr(node, 'lineno', line)}"
         self.ep.opaque.append(air.Opaque(call, reason, line, block, effects, target, origin))
 
     def _kill(self, name: str):
@@ -1141,7 +1140,7 @@ class _FunctionAnalyzer:
                     if any(isinstance(n, ast.Name) and n.id in tainted for n in ast.walk(node.iter)
                            ) and not isinstance(node.iter, ast.Call):
                         self._opaque(f"iterate {ast.unparse(node.iter)[:60]}", "unvisited_call",
-                                     getattr(node, "lineno", self.fn.lineno))
+                                     node.iter.lineno)
 
     def _snapshot(self) -> _AnalysisState:
         return _AnalysisState(
