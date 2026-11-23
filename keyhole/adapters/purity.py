@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import ast
 import builtins as _builtins
+from types import SimpleNamespace
 
 # --------------------------------------------------------------------------- tables
 
@@ -352,8 +353,12 @@ class Purity:
     def __init__(self, index, models: set[str], policy=None):
         self.index = index
         self.models = models
-        # Calls the user explicitly declared data-irrelevant in the policy file.
+        # Calls the user explicitly declared data-irrelevant in the policy file.  They are
+        # bound and screened by `declaration_for`, never matched here by bare name.
         self.declared_free = set(getattr(policy, "ignored_calls", ()) or ())
+        # Names the CURRENT top-level call site must not hand to a declared call (db
+        # handles, live queries, tracked rows); set by `call_free` for one call.
+        self._extra_dangerous: frozenset = frozenset()
         self.repo_tops = {name.split(".")[0] for name in index.modules}
         self.class_defs: dict[str, tuple[str, ast.ClassDef]] = {}
         self.module_bind_count: dict[tuple[str, str], int] = {}
@@ -669,10 +674,11 @@ class Purity:
             self._note(deps)
         return ok, (deps if ok else frozenset())
 
-    def call_free_deps(self, ctx: "_Ctx", call: ast.Call, tainted: frozenset = frozenset()):
+    def call_free_deps(self, ctx: "_Ctx", call: ast.Call, tainted: frozenset = frozenset(),
+                       dangerous: frozenset = frozenset()):
         """(free, ids): `ids` is empty only when the call is PROVEN effect-free.  A
         non-empty set means "free, provided these declarations are true"."""
-        return self._scoped(lambda: self.call_free(ctx, call, tainted))
+        return self._scoped(lambda: self.call_free(ctx, call, tainted, dangerous))
 
     def function_free_deps(self, module: str, fn, owner_class: str | None = None):
         return self._scoped(lambda: self.function_free(module, fn, owner_class))
@@ -1252,9 +1258,17 @@ class Purity:
                     return False
         return True
 
-    def call_free(self, ctx: _Ctx, call: ast.Call, tainted: frozenset = frozenset()) -> bool:
+    def call_free(self, ctx: _Ctx, call: ast.Call, tainted: frozenset = frozenset(),
+                  dangerous: frozenset = frozenset()) -> bool:
         """True only when `call` provably cannot read or write a modeled table."""
-        ok, external = self._call_free(ctx, call)
+        prev = self._extra_dangerous
+        # Only this call site's names: nested classifications (other functions' bodies)
+        # run through call_free again and install their own (empty) set.
+        self._extra_dangerous = frozenset(tainted) | frozenset(dangerous)
+        try:
+            ok, external = self._call_free(ctx, call)
+        finally:
+            self._extra_dangerous = prev
         if ok and external and tainted:
             # A trusted first-order callable handed a live query object may iterate
             # (and thereby execute) it.
@@ -1281,13 +1295,14 @@ class Purity:
 
     def _call_free(self, ctx: _Ctx, call: ast.Call) -> tuple[bool, bool]:
         func = self._callee(ctx, call)
-        name = dotted(func)
-        if name and (name in self.declared_free or name.split(".")[-1] in self.declared_free):
+        key, refused = self.declaration_for(ctx, call, self._extra_dangerous)
+        if key and not refused:
             # Explicit user declaration (policy adapter.ignore_calls): NOT a proof.  The
             # id travels with the verdict through every cache and every caller.
-            key = name if name in self.declared_free else name.split(".")[-1]
             self._note({f"declared-free:{key}"})
             return True, False
+        # No declaration, or a refused one: classify the call on its own merits.  A
+        # refused declaration contributes nothing -- the oracle must prove it or not.
         ident = self.identity(ctx, func)
         if ident is not None:
             kind, name = ident
@@ -1471,3 +1486,89 @@ class Purity:
             return False
         ident = self.identity(ctx, func.value)
         return bool(ident and ident[0] == "class")
+
+    # -------------------------------------------------- policy declarations (binding)
+    def binding_key(self, ctx: _Ctx, call: ast.Call, names) -> str | None:
+        """The entry of `names` (policy ignore_calls / helpers keys) that names THIS call.
+
+        A declaration binds by the callee's exact written spelling or by its resolved
+        qualified identity.  A bare leaf name binds only to a callee the adapter cannot
+        resolve to repository source (an unreadable receiver such as `vendor.emit`):
+        it must never silently apply to an unrelated same-named repository function."""
+        if not names:
+            return None
+        func = self._callee(ctx, call)
+        spelling = dotted(func)
+        if spelling and spelling in names:
+            return spelling
+        ident = self.identity(ctx, func)
+        qualified = ident[1] if ident and ident[0] in ("func", "class", "ext", "global") else None
+        if qualified and qualified in names:
+            return qualified
+        leaf = spelling.split(".")[-1] if spelling else (
+            func.attr if isinstance(func, ast.Attribute) else None)
+        if not leaf or leaf not in names:
+            return None
+        in_repo = bool(ident and ident[0] in ("func", "class", "localfn")) or bool(
+            self.dispatch_targets(ctx, call))
+        return None if in_repo else leaf
+
+    def _db_like_names(self, ctx: _Ctx) -> set[str]:
+        """Parameters of the enclosing function that hold a database handle."""
+        fn = ctx.fn
+        if fn is None or not hasattr(fn, "args"):
+            return set()
+        out = set()
+        a = fn.args
+        for arg in [*a.posonlyargs, *a.args, *a.kwonlyargs]:
+            ann = (dotted(arg.annotation) or "").lower() if arg.annotation is not None else ""
+            if arg.arg in {"db", "session"} or "session" in ann:
+                out.add(arg.arg)
+        return out
+
+    def declaration_for(self, ctx: _Ctx, call: ast.Call, dangerous=frozenset()):
+        """(key, refusal) for the policy `adapter.ignore_calls` declaration naming `call`.
+
+        (None, None)  no declaration names this call.
+        (key, None)   the declaration applies: the call may be treated as data-irrelevant
+                      (recorded as an assumption by the caller, never as a proof).
+        (key, why)    a declaration names it but is REFUSED; the call must then be
+                      classified on its own merits, exactly as if undeclared.
+
+        A declaration may only suppress what the adapter cannot otherwise see, and only
+        when the call cannot reach the database through what it is handed:
+          2c  refuted if the callee resolves to repository code that visibly reads or
+              writes the database;
+          2a  refused if the call is handed a db/session handle, a live query, a tracked
+              row, a model class or a callable, or is a method on such a receiver."""
+        key = self.binding_key(ctx, call, self.declared_free)
+        if key is None:
+            return None, None
+        for module, node, cls in (self.dispatch_targets(ctx, call) or []):
+            ref = SimpleNamespace(module=module, node=node, file="",
+                                  owner_class=cls.rsplit(".", 1)[-1] if cls else None)
+            if self.index.function_may_touch_db(ref):
+                return key, f"{key} is declared data-irrelevant but visibly reads or writes the database"
+        bad = set(dangerous) | self._db_like_names(ctx)
+        func = self._callee(ctx, call)
+        if isinstance(func, ast.Attribute):
+            recv = dotted(func.value)
+            if recv and (recv in bad or recv.split(".")[0] in bad):
+                return key, f"{key} is called on a database handle, live query or tracked row"
+        for kw in call.keywords:
+            if kw.arg in HIGHER_ORDER_KW and not isinstance(kw.value, ast.Constant):
+                return key, f"{key} is handed a callback ({kw.arg}=)"
+        for value in [*call.args, *(kw.value for kw in call.keywords)]:
+            for node in ast.walk(value):
+                if isinstance(node, ast.Lambda):
+                    return key, f"{key} is handed a callable"
+                if not isinstance(node, ast.Name):
+                    continue
+                if node.id in bad:
+                    return key, f"{key} is handed {node.id} (a database handle, live query or tracked row)"
+                if node.id in self.models:
+                    return key, f"{key} is handed the model class {node.id}"
+                ident = self.identity(ctx, node)
+                if ident and ident[0] in ("func", "localfn"):
+                    return key, f"{key} is handed a callable ({node.id})"
+        return key, None

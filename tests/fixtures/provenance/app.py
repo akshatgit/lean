@@ -46,14 +46,16 @@ async def clean_ping(name: str = "x"):
 @router.get("/ignored-statement/{doc_id}")
 async def ignored_statement(doc_id: int, session=Depends(get_session), user=Depends(get_current_user)):
     doc = await _owned(doc_id, session, user)
-    audit_sink.record(session, doc_id)              # statement position: `_helper`
+    audit_sink.record(doc_id)                       # statement position: `_helper`
+    # (handed only a scalar: a session-passing variant must NOT be suppressed -- see
+    #  tests/fixtures/declaration_binding)
     return doc
 
 
 @router.get("/ignored-in-condition/{doc_id}")
 async def ignored_in_condition(doc_id: int, session=Depends(get_session), user=Depends(get_current_user)):
     doc = await _owned(doc_id, session, user)
-    if vendor.lookup(session, doc_id):              # skipped position: totality sweep -> oracle
+    if vendor.lookup(doc_id):                       # skipped position: totality sweep -> oracle
         return None
     return doc
 
@@ -125,5 +127,5 @@ async def helper_guard(doc_id: int, session=Depends(get_session), user=Depends(g
 
 @router.get("/suppressed-then-idor/{doc_id}")
 async def suppressed_then_idor(doc_id: int, session=Depends(get_session), user=Depends(get_current_user)):
-    audit_sink.record(session, user, doc_id)        # could, for all we know, deny the request
+    audit_sink.record(user, doc_id)                 # could, for all we know, deny the request
     return await session.get(Doc, doc_id)

@@ -1,0 +1,14 @@
+# Confirmed policy: every verdict difference in this fixture comes from declaration binding.
+principal:
+  id: current_user.id
+adapter:
+  ignore_calls:
+    - record          # audit_sink.record(...)   - unreadable
+    - foo             # meant for vendor.foo(...) - unreadable
+    - flush_metrics   # session.flush_metrics()  - a method on the db handle
+    - peek            # in-repo, but visibly reads Doc -> refuted
+    - get_audit_ctx   # dependency that FastAPI hands a session -> refused, analysed
+resources:
+  Doc:
+    confirmed: true
+    read: owner(owner_id)

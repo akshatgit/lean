@@ -728,11 +728,25 @@ class _FunctionAnalyzer:
     def _pctx(self):
         return self.index.purity.ctx_for(self.module, self.fn, self.owner_class)
 
+    def _dangerous_names(self) -> frozenset:
+        """Names a declared-irrelevant call must not be handed: anything through which
+        it could reach the database (handles, live queries, tracked/created rows)."""
+        return frozenset(self.db_vars | set(self.rows) | set(self.creates)
+                         | set(self.queries) | set(self.query_results))
+
+    def _declaration(self, call):
+        """(key, refusal) for the policy ignore_calls entry naming `call` (see
+        Purity.declaration_for); (None, None) when there is no index or no entry."""
+        if self.index is None or not (self.policy and self.policy.ignored_calls):
+            return None, None
+        return self.index.purity.declaration_for(self._pctx(), call, self._dangerous_names())
+
     def _free(self, call) -> bool:
         """True only if the purity oracle PROVES `call` cannot touch the database."""
         if self.index is None:
             return False
-        ok, deps = self.index.purity.call_free_deps(self._pctx(), call, frozenset(self._query_names))
+        ok, deps = self.index.purity.call_free_deps(
+            self._pctx(), call, frozenset(self._query_names), self._dangerous_names())
         self._assume_declared(deps)
         return ok
 
@@ -850,6 +864,7 @@ class _FunctionAnalyzer:
             return
         purity, ctx = self.index.purity, self._pctx()
         tainted = frozenset(self._query_names)
+        dangerous = self._dangerous_names()
         for stmt in self.fn.body:
             for node in ast.walk(stmt):
                 if id(node) in self._visited:
@@ -857,7 +872,7 @@ class _FunctionAnalyzer:
                 if isinstance(node, ast.Call):
                     if self._session_lifecycle(node):
                         continue
-                    free, deps = purity.call_free_deps(ctx, node, tainted)
+                    free, deps = purity.call_free_deps(ctx, node, tainted, dangerous)
                     if not free:
                         name = _dotted(node.func) or ast.unparse(node.func)[:80]
                         self._opaque(f"{name}(...)", "unvisited_call", node.lineno)
@@ -1662,7 +1677,9 @@ class _FunctionAnalyzer:
             return True
         if short in CONTAINER_METHODS and self.var_types.get(root) in CONTAINER_TYPES:
             return True
-        return bool(self.policy and (name in self.policy.ignored_calls or short in self.policy.ignored_calls))
+        # Policy `adapter.ignore_calls` is NOT consulted here by name: declarations are
+        # call-level (binding + refusal, see _declaration) and handled where the call is.
+        return False
 
     def _unresolved_names(self, node) -> set[str]:
         return {
@@ -1691,6 +1708,11 @@ class _FunctionAnalyzer:
             return True
         if self._ignored_call(name) or name in self.models:
             return True
+        declared, refused = self._declaration(call)
+        if declared and not refused:
+            self._assume(f"ignore:{declared}", f"call {declared} is declared data-irrelevant in the "
+                                               f"policy (adapter.ignore_calls); it was not analyzed")
+            return True
         constructor = (name or "").split(".")[-1]
         if self.index is not None and constructor in self.index.classes:
             init_refs = [
@@ -1699,8 +1721,9 @@ class _FunctionAnalyzer:
             ]
             if not init_refs or all(not self.index.function_may_touch_db(ref) for ref in init_refs):
                 return True
-        if name and (name in self.summaries or (self.policy and (
-                name in self.policy.helper_guards or name.split(".")[-1] in self.policy.helper_guards))):
+        if name and name in self.summaries:
+            return True
+        if self._helper_key(call):
             return True
         if self.query(call) is not None:
             return True
@@ -1726,12 +1749,21 @@ class _FunctionAnalyzer:
             self._opaque(display, f"unresolved_result_in_{use.replace(' ', '_')}", call.lineno,
                          effects=False)
 
+    def _helper_key(self, call) -> str | None:
+        """The policy `helpers:` entry naming THIS call, bound by spelling or resolved
+        identity (never a bare leaf that resolves to unrelated repository code)."""
+        if not (self.policy and self.policy.helper_guards):
+            return None
+        if self.index is None:
+            name = _dotted(call.func)
+            return name if name in self.policy.helper_guards else None
+        return self.index.purity.binding_key(self._pctx(), call, self.policy.helper_guards)
+
     def _trusted_helper(self, name: str | None, call) -> bool:
         if not self.policy or not name:
             return False
-        short = name.split(".")[-1]
-        key = name if name in self.policy.helper_guards else short
-        if key not in self.policy.helper_guards:
+        key = self._helper_key(call)
+        if key is None:
             return False
         self._assume(f"helper-guard:{key}",
                      f"helper {key} is declared in the policy to enforce a guard (not verified against its body)")
@@ -1920,6 +1952,43 @@ class _FunctionAnalyzer:
             self.rows[var] = row
         return bool(analysis.effects or analysis.opaque or analysis.returned_row or analysis.row_guards)
 
+    def _dependency_declaration(self, dep_name, qualified, ref) -> str | None:
+        """The ignore_calls entry that may suppress dependency `dep_name`, or None.
+
+        Same rules as a call (Purity.declaration_for): bound by spelling or resolved
+        identity, a bare leaf only when the dependency's source is unreadable (2b);
+        refuted when its visible body reads or writes the database (2c); refused when
+        FastAPI hands it a database handle, i.e. it declares a db/session parameter
+        (2a) -- then it is analyzed like any other dependency."""
+        names = self.policy.ignored_calls if self.policy else set()
+        if not names:
+            return None
+        leaf = dep_name.split(".")[-1]
+        if dep_name in names:
+            key = dep_name
+        elif qualified in names:
+            key = qualified
+        elif leaf in names and ref is None:
+            key = leaf
+        else:
+            return None
+        if ref is None:
+            return key  # unreadable: the declaration is the only knowledge we have
+        if self.index.function_may_touch_db(ref):
+            return None
+        args = [*ref.node.args.posonlyargs, *ref.node.args.args, *ref.node.args.kwonlyargs]
+        defaults = [None] * (len(ref.node.args.posonlyargs) + len(ref.node.args.args)
+                             - len(ref.node.args.defaults)) + list(ref.node.args.defaults) \
+            + list(ref.node.args.kw_defaults)
+        for arg, default in zip(args, defaults):
+            ann = (_annotation_dotted(arg.annotation) or "").lower()
+            dep = (self._depends_target(default) or self._depends_target(arg.annotation)
+                   or self.index.annotation_dependency(ref.module, arg.annotation) or "")
+            low = dep.split(".")[-1].lower()
+            if arg.arg in {"db", "session"} or "session" in ann or "db" in low or "session" in low:
+                return None
+        return key
+
     def _analyze_dependency(self, var, dep_name, dep_module=None, as_principal=False):
         """Model a `Depends(get_x)` parameter: its body's row read and the ownership
         guards it enforces, mapped onto the endpoint variable `var`. If the dependency
@@ -1940,16 +2009,17 @@ class _FunctionAnalyzer:
         line = self.fn.lineno
         arg_type = self.var_types.get(var)
         typed_resource = bool(arg_type and arg_type in self.models)
-        if self.policy and dep_name.split(".")[-1] in self.policy.ignored_calls:
-            short = dep_name.split(".")[-1]
-            self._assume(f"ignore:{short}", f"dependency {short} is declared data-irrelevant in the "
-                                            f"policy (adapter.ignore_calls); its body was not analyzed")
-            return  # explicitly declared data-irrelevant in the policy
         # Exact import resolution only: a dependency must never be matched to a
         # same-named method somewhere else in the repository.
-        ref = self.index.functions.get(self.index.resolve_name(dep_module or self.module, dep_name))
+        qualified_dep = self.index.resolve_name(dep_module or self.module, dep_name)
+        ref = self.index.functions.get(qualified_dep)
         if ref is not None and ref.owner_class is not None:
             ref = None
+        declared = self._dependency_declaration(dep_name, qualified_dep, ref)
+        if declared:
+            self._assume(f"ignore:{declared}", f"dependency {declared} is declared data-irrelevant in the "
+                                               f"policy (adapter.ignore_calls); its body was not analyzed")
+            return  # explicitly declared data-irrelevant in the policy
         if ref is None:
             # FastAPI runs this code before the handler.  If we cannot read it we
             # cannot rule out object access, whatever the parameter is typed as.
@@ -2102,12 +2172,13 @@ class _FunctionAnalyzer:
         for value in [*call.args, *(kw.value for kw in call.keywords)]:
             if isinstance(value, (ast.Call, ast.Await)):
                 self._expr_effects(value, line)
-        if name and self.policy and (
-                name in self.policy.ignored_calls or name.split(".")[-1] in self.policy.ignored_calls):
-            declared = name if name in self.policy.ignored_calls else name.split(".")[-1]
+        declared, refused = self._declaration(call)
+        if declared and not refused:
             self._assume(f"ignore:{declared}", f"call {declared} is declared data-irrelevant in the "
                                                f"policy (adapter.ignore_calls); it was not analyzed")
             return  # explicit, user-declared: data-irrelevant, and recorded as an assumption
+        # A refused declaration (handed a db handle/row/query/callable, or refuted by the
+        # callee's visible body) contributes nothing: classify the call as undeclared.
         if self._session_lifecycle(call):
             return  # transaction control on the session itself: no row is selected
         if self._trusted_helper(name, call):
