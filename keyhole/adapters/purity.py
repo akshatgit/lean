@@ -96,6 +96,12 @@ EXT_FREE_MODULES = (
     "logging.", "warnings.", "traceback.", "http.", "ipaddress.", "enum.",
     "fastapi.responses.", "starlette.responses.", "fastapi.exceptions.",
     "starlette.exceptions.", "fastapi.status.", "starlette.status.",
+    # Host/OS/network modules: first-order (no public callable invokes a passed
+    # callback outside the kw-guard) and holding no database handle, so a module-level
+    # call into them cannot reach a modeled table (A3).  Only `module.attr(...)` calls
+    # match this prefix; methods on a returned instance stay opaque unless typed.
+    "platform.", "socket.", "fcntl.", "select.", "resource.", "getpass.",
+    "sysconfig.", "psutil.",
 )
 EXT_FREE_EXACT = {
     "re.compile", "re.match", "re.search", "re.fullmatch", "re.findall", "re.finditer",

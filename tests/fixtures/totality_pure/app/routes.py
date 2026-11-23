@@ -1,6 +1,9 @@
 """Every call besides the owner-checked load is PROVABLY unable to touch the database,
 by import identity, receiver type, or transitive closure.  These routes must be SAFE."""
 import anyio
+import platform
+import psutil
+import socket
 import threading
 from threading import RLock as reentrant_lock
 from asyncio import to_thread
@@ -29,6 +32,16 @@ def process_locks():
 @router.get("/plugin-lock")
 def plugin_lock(threading):
     return threading.Lock()
+
+
+@router.get("/host-facts")
+def host_facts():
+    return (platform.system(), socket.gethostname(), bool(psutil.Process()))
+
+
+@router.get("/plugin-host")
+def plugin_host(platform):
+    return platform.system()
 
 
 @dataclass(frozen=True, slots=True)

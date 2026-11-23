@@ -82,9 +82,56 @@ The notable behavior is:
 - violations preceded by relevant opaque behavior or unmodeled checks become POSSIBLE VIOLATION;
 - reports include filters, coverage warnings, assumptions, blockers, policy provenance, and stats;
 - `keyhole validate-policy` validates externally generated policy files;
-- third-party adapters can register through the `keyhole.adapters` entry-point group.
+- third-party adapters can register through the `keyhole.adapters` entry-point group;
+- the effect-free oracle's curated `EXT_FREE_MODULES` surface now includes host/OS/network
+  modules (`platform`, `socket`, `fcntl`, `select`, `resource`, `getpass`, `sysconfig`,
+  `psutil`); a module-level call into them holds no database handle and so cannot reach a
+  modeled table (trust assumption A3). Only `module.attr(...)` calls match; methods on a
+  returned instance stay opaque unless their receiver type is known. This is a generic
+  stdlib/system completion, not a Langflow-specific rule.
 
 The statements of Lean theorems `check_sound` and `check_witness` were not changed.
+
+## Update 2026-11-23: LLM-Drafted Assumptions and the Iteration Loop
+
+The dominant barrier to decisiveness is coverage, not proving: on the native Langflow scan
+(396 endpoints, Claude policy + repository assumptions) 362 endpoints contain at least one
+effect-capable operation the extractor cannot resolve, and the median blocked endpoint is
+gated by roughly 38 distinct unresolved targets. An endpoint becomes decidable only when
+*all* of its blockers clear, so per-target engine work alone cannot flip verdicts in bulk —
+the greedy set-cover of shared blockers frees only ~56 of 362 endpoints across its top 25.
+
+The designed home for the residue is the fingerprinted, review-gated assumptions file. It
+keeps application-specific facts (what a given service locator returns, whether a specific
+helper touches a table) out of the generic engine — the same anti-overfitting boundary this
+document already states. An LLM/subagent is a sound fit as the *drafter*, never the verifier:
+
+1. The worklist (`keyhole worklist --include-possible`) ranks unresolved targets by the
+   endpoints each would free.
+2. An LLM reads each top target's real body and drafts an assumption — `effects: [...]`,
+   `effects: []`, or `returns_type: ...` — with a file/line/quote evidence block. It must
+   withhold any target whose behavior depends on dynamic dispatch or a plugin hook rather
+   than assert `effects: []` on it.
+3. Entries are UNREVIEWED, so every verdict that uses one is amber until a human runs
+   `keyhole review`, which digests the claim against the exact source it was written for.
+4. Re-scan; resolved blockers drop out and the next, deeper layer surfaces in the worklist.
+   The loop converges and, as it stalls, it *measures* the true ceiling — the targets that
+   are genuinely undecidable statically.
+
+Measured one iteration (8 LLM-drafted Category-1 assumptions from the worklist head; 7
+Category-2 targets correctly withheld): UNKNOWN 131 -> 108, SAFE(assumed) 6 -> 9,
+NO EFFECTS(assumed) 2 -> 4, POSSIBLE VIOLATION 236 -> 254 (the newly exposed accesses are
+visible candidate findings, not hidden). Modeled accesses rose 2,302 -> 3,842 and blocker
+records fell ~42%, with no soundness compromise (no `effects: []` asserted on a dynamic
+dispatcher). These assumption entries are a prototype and are not committed.
+
+For contrast, the generic engine fix above (host/OS/network modules) removed 169 blocker
+records on the same scan but flipped zero endpoints — exactly because each affected endpoint
+retains effect-capable blockers in its stack. The lesson for the next maintainer: general
+sound rules reduce reviewer noise and help every app, but per-endpoint decisiveness on a
+dynamic application is driven by the assumption loop. The remaining generic headroom is
+stronger receiver type inference (sound, but hard), not blanket method-name purity, which the
+oracle refuses by design because `x.get(...)` may be `session.get(Model, id)`.
 
 ## Reproduction
 
@@ -135,9 +182,12 @@ Langflow-specific names.
    `AuthzRole.read: false`, while Langflow documents role metadata as readable by authenticated
    users.
 2. Review the 157 POSSIBLE VIOLATION endpoints, starting with blockers shared by many routes.
-3. Reduce the 162 UNKNOWN endpoints through generic modeling. The largest current causes are
-   authorization-audit recursion/depth limits, dynamic `select` helpers, unavailable `session.exec`
-   or `session.add` sources, and unresolved container/configuration calls.
+3. Reduce the UNKNOWN endpoints. Drive this with the LLM-assumption iteration loop in the
+   2026-11-23 update above, not with more Langflow-tuned engine rules; the largest residual
+   causes are authorization-audit recursion/depth limits, dynamic `select` helpers,
+   unavailable `session.exec`/`session.add` sources, and unresolved container/configuration
+   calls. A repeatable `scan -> worklist -> LLM draft -> human review -> re-scan` harness and a
+   human review pass over the drafted assumptions are the next concrete deliverables.
 4. Add another independent application fixture or adapter before making broad claims about
    framework-agnostic coverage. The engine boundary is generic, but the only built-in source adapter
    remains FastAPI with SQLAlchemy.

@@ -54,6 +54,13 @@ def test_process_lock_allocation_requires_stdlib_identity(pure):
     assert effect_opaque(pure["GET /plugin-lock"])
 
 
+def test_host_modules_free_only_by_import_identity(pure):
+    # platform/socket/psutil module-level calls hold no DB handle -> effect-free.
+    assert pure["GET /host-facts"].verdict == "no_effects"
+    # but only by import identity: a parameter shadowing the module stays opaque.
+    assert effect_opaque(pure["GET /plugin-host"])
+
+
 def test_dataclass_slot_store_requires_a_known_slot_on_self(pure):
     assert pure["GET /snapshot"].verdict == "no_effects"
     assert effect_opaque(pure["GET /write-unknown"])
