@@ -2,6 +2,7 @@
 by import identity, receiver type, or transitive closure.  These routes must be SAFE."""
 import anyio
 from asyncio import to_thread
+from dataclasses import dataclass
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -11,6 +12,45 @@ from .models import Doc, DocOut
 router = APIRouter()
 
 ASSET = Path("asset.bin")
+
+
+@dataclass(frozen=True, slots=True)
+class Snapshot:
+    names: frozenset[str] = frozenset()
+
+    def __post_init__(self):
+        object.__setattr__(self, "names", frozenset(self.names))
+
+
+@router.get("/snapshot")
+def snapshot():
+    return Snapshot()
+
+
+@router.get("/write-unknown")
+def write_unknown(target):
+    object.__setattr__(target, "names", frozenset())
+
+
+@dataclass(slots=True)
+class SnapshotWithSetter:
+    name: str
+
+    def __post_init__(self):
+        object.__setattr__(self, "display", self.name)
+
+    @property
+    def display(self):
+        return self.name
+
+    @display.setter
+    def display(self, value):
+        get_session().add(Doc(title=value))
+
+
+@router.get("/snapshot-with-setter")
+def snapshot_with_setter(name: str):
+    return SnapshotWithSetter(name)
 
 
 def load_asset():

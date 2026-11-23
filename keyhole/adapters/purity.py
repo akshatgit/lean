@@ -1407,6 +1407,32 @@ class Purity:
                 return func.value
         return func
 
+    def _dataclass_slot_store(self, ctx, call):
+        """object.__setattr__(self, literal, value) writing a dataclass-generated slot."""
+        if (not ctx.owner or ctx.fn.name != "__post_init__" or ctx.fn.decorator_list
+                or len(call.args) != 3 or call.keywords
+                or not isinstance(call.args[0], ast.Name) or call.args[0].id != ctx.self_name
+                or self.etype(ctx, call.args[0]) != ("inst", ctx.owner)
+                or not isinstance(call.args[1], ast.Constant) or not isinstance(call.args[1].value, str)
+                or self._descendants(ctx.owner)):
+            return False
+        field = call.args[1].value
+        module, cls = self.class_defs[ctx.owner]
+        if field.startswith("__") or cls.bases or cls.keywords or len(cls.decorator_list) != 1:
+            return False
+        dec = cls.decorator_list[0]
+        mctx = self.module_ctx(module)
+        if (not isinstance(dec, ast.Call) or self.identity(mctx, dec.func) != ("ext", "dataclasses.dataclass")
+                or not any(k.arg == "slots" and isinstance(k.value, ast.Constant) and k.value.value is True
+                           for k in dec.keywords)):
+            return False
+        for item in cls.body:
+            if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name) and item.target.id == field:
+                ann = item.annotation.value if isinstance(item.annotation, ast.Subscript) else item.annotation
+                ident = self.identity(mctx, ann)
+                return bool(ident and ident[0] == "builtin" and ident[1] in BUILTIN_VALUE_TYPES)
+        return False
+
     def _call_free(self, ctx: _Ctx, call: ast.Call) -> tuple[bool, bool]:
         func = self._callee(ctx, call)
         key, refused = self.declaration_for(ctx, call, self._extra_dangerous)
@@ -1462,6 +1488,8 @@ class Purity:
                                 | PYDANTIC_CLASS_METHODS)
             return bool(others) or attr in trusted_external, False
         base_ident = self.identity(ctx, func.value)
+        if base_ident == ("builtin", "object") and attr == "__setattr__":
+            return self._dataclass_slot_store(ctx, call), True
         if base_ident and base_ident[0] == "class":
             return self._class_method_free(base_ident[1], attr), False
         if base_ident and base_ident[0] == "builtin" and base_ident[1] in BUILTIN_VALUE_TYPES:
