@@ -94,6 +94,20 @@ def test_deep_read_is_displayed_under_direct_helper(kernel):
     assert "read Doc" in trace
 
 
+def test_nullable_query_filters_require_a_column_on_the_selected_table(kernel, tmp_path):
+    template = (FIXTURE / "keyhole.policy.yaml").read_text()
+    config = tmp_path / "shared.yaml"
+    config.write_text(template.replace("read: owner(owner_id)", "read: owner(owner_id) or is_null(owner_id)"))
+    keys = ["GET /shared-docs", "GET /shared-peer-filter"]
+    shared, other = check_endpoints([kernel[key].endpoint for key in keys], load_policy(config))
+    assert shared.verdict == "safe"
+    assert other.effects[0].effect.selector is True
+    assert other.verdict == "possible_violation"
+    assert kernel["GET /null-owner-only"].effects[0].effect.selector == {
+        "eq": [{"field": "owner_id"}, {"const": None}]
+    }
+
+
 @pytest.mark.parametrize("allow,expected", [
     ("owner(owner_id)", "violation"),
     ("owner(owner_id) or is_null(owner_id)", "safe"),

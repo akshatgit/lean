@@ -1390,11 +1390,28 @@ class _FunctionAnalyzer:
             return self.term(e.args[0], query_model=query_model)
         return None
 
+    def _sql_null_test(self, column, model):
+        purity, ctx = self.index.purity, self._pctx()
+        if (isinstance(column, ast.Call) and len(column.args) == 1 and not column.keywords
+                and purity.identity(ctx, column.func) == ("ext", "sqlmodel.col")):
+            column = column.args[0]
+        if (not isinstance(column, ast.Attribute) or self._model_of(column) != model
+                or purity.etype(ctx, column) != ("sqlexpr",)):
+            raise _Unsupported("null test on unresolved or different table column")
+        return air.eq(air.fld(column.attr), air.const(None))
+
     def cond(self, e, query_model=None):
         """Predicate for a filter/where clause."""
         self._mark_unresolved_uses(e, "row selector")
         self._mark_unresolved_calls(e, "row selector")
+        if (query_model and self.index and isinstance(e, ast.Call) and isinstance(e.func, ast.Attribute)
+                and e.func.attr == "is_" and len(e.args) == 1 and not e.keywords
+                and isinstance(e.args[0], ast.Constant) and e.args[0].value is None):
+            return self._sql_null_test(e.func.value, query_model)
         if isinstance(e, ast.Compare) and len(e.ops) == 1 and isinstance(e.ops[0], ast.Eq):
+            if (query_model and self.index and isinstance(e.comparators[0], ast.Constant)
+                    and e.comparators[0].value is None):
+                return self._sql_null_test(e.left, query_model)
             a = self.term(e.left, query_model=query_model)
             b = self.term(e.comparators[0], query_model=query_model)
             if a is None or b is None:

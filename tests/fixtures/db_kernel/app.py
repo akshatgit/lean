@@ -2,7 +2,7 @@
 (the authorization is really there -> SAFE) and a negative twin (it is not -> VIOLATION)."""
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlmodel import Field, SQLModel, func, select, update
+from sqlmodel import Field, SQLModel, col, func, select, update
 
 router = APIRouter()
 
@@ -17,10 +17,30 @@ class DocCreate(BaseModel):
     title: str
 
 
+class Peer(SQLModel, table=True):
+    id: int = Field(primary_key=True)
+    owner_id: int | None
+
+
 def get_current_user(): ...
 
 
 def get_session(): ...
+
+
+@router.get("/shared-docs")
+async def shared_docs(session=Depends(get_session), user=Depends(get_current_user)):
+    return (await session.exec(select(Doc).where((Doc.owner_id == user.id) | col(Doc.owner_id).is_(None)))).all()
+
+
+@router.get("/shared-peer-filter")
+async def shared_peer_filter(session=Depends(get_session), user=Depends(get_current_user)):
+    return (await session.exec(select(Doc).where(Peer.owner_id == None))).all()
+
+
+@router.get("/null-owner-only")
+async def null_owner_only(session=Depends(get_session)):
+    return (await session.exec(select(Doc).where(Doc.owner_id == None))).all()
 
 
 # ---------------------------------------------------------------- model-parametric helpers
