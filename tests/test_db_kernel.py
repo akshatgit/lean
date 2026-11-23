@@ -78,6 +78,17 @@ def test_recursion_is_cut_not_followed_forever(kernel):
     assert any(o.reason == "recursion_or_depth_limit" for o in res.endpoint.opaque)
 
 
+def test_deep_read_is_displayed_under_direct_helper(kernel):
+    from keyhole.report import _html_helper_trace
+
+    res = kernel["GET /deep/checked/{doc_id}"]
+    trace = _html_helper_trace(res)
+    assert trace.count("<summary>") == 1
+    assert "_level1_checked" in trace
+    assert "1 modeled effects" in trace
+    assert "read Doc" in trace
+
+
 def test_owner_filter_reaches_the_effect_through_the_parametric_helper(kernel):
     read = kernel["GET /generic/owned/{doc_id}"].effects[0].effect
     assert read.resource == "Doc"                     # `model` resolved to the caller's class

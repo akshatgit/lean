@@ -705,7 +705,20 @@ class _FunctionAnalyzer:
     def run(self) -> air.Endpoint:
         self._signature()
         self._analyze_body()
+        # Include resolved body helpers even when analysis emitted no evidence.
+        pending = list(self.fn.body)
+        while pending:
+            node = pending.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                continue
+            if isinstance(node, ast.Call) and self._strict_ref(node)[0]:
+                self.ep.helper_sites.add(self._call_site(node))
+            pending.extend(ast.iter_child_nodes(node))
         return self.ep
+
+    @staticmethod
+    def _call_site(call):
+        return call.lineno, call.col_offset, ast.unparse(call.func)
 
     def _analyze_body(self):
         if self.analyze_dependencies:
@@ -2127,7 +2140,7 @@ class _FunctionAnalyzer:
             return True
         analysis, bound = self._helper_analysis(ref, call, skip_first)
         self._apply_helper_analysis(analysis, bound, var, line,
-                                    self.index.purity.call_target(self._pctx(), call))
+                                    self.index.purity.call_target(self._pctx(), call), call, ref.file)
         if analysis.returned_query is not None:
             # The helper hands back a statement that nothing here tracks: whoever
             # executes it does so outside the model.
@@ -2155,7 +2168,7 @@ class _FunctionAnalyzer:
             return None
         line = getattr(call, "lineno", self.fn.lineno)
         self._apply_helper_analysis(analysis, bound, "_ret", line,
-                                    self.index.purity.call_target(self._pctx(), call))
+                                    self.index.purity.call_target(self._pctx(), call), call, ref.file)
         state = copy.deepcopy(analysis.returned_query)
         # A condition whose helper-parameter terms cannot be expressed here widens to True.
         conds = [self._substitute_pred(c, bound) for c in state.conds]
@@ -2257,7 +2270,9 @@ class _FunctionAnalyzer:
             self.index.summary_cache[cache_key] = copy.deepcopy(analysis)
         return analysis, bound
 
-    def _apply_helper_analysis(self, analysis, bound, var, line, symbol=None):
+    def _apply_helper_analysis(self, analysis, bound, var, line, symbol, call, source_file):
+        site = self._call_site(call)
+        self.ep.helper_sites.add(site)
         copied_effects = []
         effect_by_child_id = {}
         for effect in analysis.effects:
@@ -2270,6 +2285,7 @@ class _FunctionAnalyzer:
             ]
             copied.assumed_from = copied.assumed_from or self.global_assumed_from
             copied.line = line
+            copied.helper_site = site
             copied._analysis_id = self._next_effect_id
             self._next_effect_id += 1
             self.ep.effects.append(copied)
@@ -2279,9 +2295,10 @@ class _FunctionAnalyzer:
         for opaque in analysis.opaque:
             self.ep.opaque.append(air.Opaque(
                 opaque.call, opaque.reason, line, opaque.may_block, opaque.may_have_effects,
-                opaque.target, opaque.origin, (*opaque.via, symbol) if symbol else opaque.via))
+                opaque.target, opaque.origin, (*opaque.via, symbol) if symbol else opaque.via, site))
         for check in analysis.unmodeled_checks:
-            self.ep.unmodeled_checks.append(air.UnmodeledCheck(check.expression, line))
+            self.ep.unmodeled_checks.append(air.UnmodeledCheck(
+                check.expression, line, check.origin or f"{source_file}:{check.line}", site))
         for key, reason in analysis.assumptions.items():
             self._assume(key, reason)  # whatever the helper's model assumed, the caller assumes
 
@@ -2438,6 +2455,7 @@ class _FunctionAnalyzer:
             copied.guards = [*self.global_guards, *copied.guards]
             copied.assumed_from = copied.assumed_from or self.global_assumed_from
             copied.line = line
+            copied.helper_site = None
             copied._analysis_id = self._next_effect_id
             self._next_effect_id += 1
             self.ep.effects.append(copied)
@@ -2448,7 +2466,8 @@ class _FunctionAnalyzer:
                 opaque.call, opaque.reason, line, opaque.may_block, opaque.may_have_effects,
                 opaque.target, opaque.origin, (*opaque.via, qualified)))
         for check in child.ep.unmodeled_checks:
-            self.ep.unmodeled_checks.append(air.UnmodeledCheck(check.expression, line))
+            self.ep.unmodeled_checks.append(air.UnmodeledCheck(
+                check.expression, line, check.origin or f"{ref.file}:{check.line}"))
         for key, reason in child.ep.assumptions.items():
             self._assume(key, reason)
 

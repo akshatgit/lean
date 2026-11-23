@@ -111,6 +111,7 @@ class Effect:
     guards: list = field(default_factory=list)
     line: int = 0
     assumed_from: str | None = None   # summary name if this effect came from an LLM summary
+    helper_site: tuple | None = field(default=None, compare=False)
 
     def to_json(self) -> dict:
         d = {"kind": self.kind, "resource": self.resource,
@@ -140,6 +141,7 @@ class Opaque:
     # Symbols of the helper calls (innermost first) through which this opaque reached the
     # endpoint.  An assumption on any of them accounts for it as well.
     via: tuple = ()
+    helper_site: tuple | None = field(default=None, compare=False)
 
     def to_json(self) -> dict:
         data = {"call": self.call, "reason": self.reason, "line": self.line,
@@ -157,6 +159,8 @@ class Opaque:
 class UnmodeledCheck:
     expression: str
     line: int = 0
+    origin: str | None = field(default=None, compare=False)
+    helper_site: tuple | None = field(default=None, compare=False)
 
     def to_json(self) -> dict:
         return {"expression": self.expression, "line": self.line}
@@ -179,6 +183,7 @@ class Endpoint:
     # summary, an identity fact, ...).  It is a set and only ever grows; a verdict may be
     # clean green only if it is empty.
     assumptions: dict = field(default_factory=dict)
+    helper_sites: set = field(default_factory=set, compare=False)
 
     @property
     def key(self) -> str:

@@ -4,6 +4,7 @@ from __future__ import annotations
 import html
 import json
 import re
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 from . import air
@@ -72,16 +73,34 @@ def _display_status(res) -> tuple[str, str]:
 
 def _status_explanation(res) -> str:
     label, _ = _display_status(res)
+    if res.verdict == "possible_violation":
+        causes = set()
+        for effect in res.effects:
+            if effect.verdict != "possible_violation":
+                continue
+            for blocker in effect.blocking_calls:
+                if blocker.startswith("policy for ") and blocker.endswith(" is not confirmed"):
+                    causes.add("unconfirmed resource policy")
+                elif blocker.startswith("rests on assumption "):
+                    causes.add("assumptions used during extraction")
+                elif blocker.startswith("unmodelled check at line "):
+                    causes.add("omitted checks or query filters")
+                else:
+                    causes.add("unresolved calls")
+        explanation = "Lean found a counterexample in the extracted model."
+        if causes:
+            explanation += " Review the " + ", ".join(sorted(causes)) + " listed with the counterexamples."
+        return explanation
+    if res.verdict == "unknown":
+        if not res.effects:
+            return "No access was extracted. Unresolved operations could still read or write protected data."
+        if all(e.verdict == "safe" for e in res.effects):
+            return ("Every extracted access satisfies the supplied policy. Unresolved operations "
+                    "could introduce additional reads or writes.")
+        return "At least one access or operation still requires analysis."
     explanations = {
-        "Possible violation": (
-            "Within the extracted model, Lean found a request that can touch a row the policy denies. "
-            "An earlier opaque call may enforce authorization or stop the request, so treat this as a lead to review."
-        ),
         "VIOLATION (modeled)": (
             "Lean found a concrete counterexample: the modeled endpoint can touch a row that the confirmed policy denies."
-        ),
-        "Unknown": (
-            "The adapter could not model enough of this endpoint to prove it safe or produce a complete violation result."
         ),
         "Safe (assumed)": (
             "Lean proved the extracted effect follows the supplied policy, but that policy or a helper summary has not been confirmed."
@@ -276,7 +295,7 @@ _HTML_STYLE = """
   .finding.safe_assumed { border-left-color: var(--assumed); }
   .finding.no_effects { border-left-color: var(--neutral); }
   .finding.no_effects_assumed { border-left-color: var(--assumed); }
-  .finding summary {
+  .finding > summary {
     display: grid;
     grid-template-columns: minmax(125px, 175px) 1fr auto;
     gap: 12px;
@@ -285,6 +304,7 @@ _HTML_STYLE = """
     cursor: pointer;
   }
   .finding summary:hover { background: #f8fafc; }
+  .detail details > summary { cursor: pointer; padding: 4px 0; }
   .status { font-weight: 750; }
   .violation .status { color: var(--violation); }
   .possible_violation .status { color: var(--possible); }
@@ -320,7 +340,7 @@ _HTML_STYLE = """
   [hidden] { display: none !important; }
   @media (max-width: 850px) {
     .toolbar { position: static; grid-template-columns: 1fr 1fr; }
-    .finding summary { grid-template-columns: 1fr; }
+    .finding > summary { grid-template-columns: 1fr; }
   }
   @media (max-width: 520px) { .toolbar { grid-template-columns: 1fr; } }
 </style>
@@ -381,6 +401,46 @@ def _html_effect_rows(res, policy) -> str:
     return "".join(rows)
 
 
+def _html_helper_trace(res):
+    ep = res.endpoint
+    operations = defaultdict(Counter)
+    checks = defaultdict(Counter)
+    effects = defaultdict(list)
+    for op in ep.opaque:
+        key = (op.call, op.reason, op.origin, op.line, op.may_have_effects, op.may_block, op.via, op.target)
+        operations[op.helper_site][key] += 1
+    for check in ep.unmodeled_checks:
+        checks[check.helper_site][check.expression, check.origin or f"{ep.file}:{check.line}"] += 1
+    for er in res.effects:
+        effects[er.effect.helper_site].append(er)
+
+    groups = []
+    sites = sorted(ep.helper_sites)
+    if None in operations or None in checks:
+        sites.append(None)
+    for site in sites:
+        label = f"{site[2]} · line {site[0]}" if site else "Other endpoint or dependency evidence"
+        ops = operations[site]
+        capable = sum(count for key, count in ops.items() if key[4])
+        value_only = sum(ops.values()) - capable
+        rows = []
+        for er in effects[site]:
+            rows.append(f"<li>{_h(er.effect.kind)} {_h(er.effect.resource)} · {_h(er.verdict)}</li>")
+        for (expr, origin), count in checks[site].items():
+            rows.append(f"<li>Dropped check: {_h(expr)} · {_h(origin)} × {count}</li>")
+        for (call, reason, origin, line, may_effect, may_block, via, target), count in ops.items():
+            path = " → ".join(reversed(via))
+            location = origin or f"reported at {ep.file}:{line}"
+            rows.append(f"<li>{_h(call)} · {_h(reason)} · {_h(location)} · "
+                        f"{'effect-capable' if may_effect else 'value only'}"
+                        f"{' · may block' if may_block else ''} · {_h(path)} · {_h(target or '')} × {count}</li>")
+        groups.append(f"<details><summary>{_h(label)} · {len(effects[site])} modeled effects · "
+                      f"{capable} effect-capable · {value_only} value only · "
+                      f"{sum(checks[site].values())} dropped checks</summary>"
+                      f"<ul class=\"compact\">{''.join(rows)}</ul></details>")
+    return "<h3>Helper trace</h3>" + "".join(groups) if groups else ""
+
+
 def _html_finding(res, policy) -> str:
     ep = res.endpoint
     label, status_key = _display_status(res)
@@ -398,7 +458,7 @@ def _html_finding(res, policy) -> str:
     if res.effects:
         effects_html = (
             "<h3>Modeled effects</h3>"
-            "<table><thead><tr><th>Kind</th><th>Resource</th><th>Lean result</th>"
+            "<table><thead><tr><th>Kind</th><th>Resource</th><th>Access verdict</th>"
             "<th>Rows touched when</th><th>Policy allows when</th></tr></thead>"
             f"<tbody>{_html_effect_rows(res, policy)}</tbody></table>"
         )
@@ -414,13 +474,6 @@ def _html_finding(res, policy) -> str:
     if violations:
         violation_html = "<h3>Counterexample</h3><ul class=\"compact\">" + "".join(violations) + "</ul>"
 
-    opaque_html = ""
-    if ep.opaque:
-        opaque_items = "".join(
-            f"<li><code>{_h(o.call)}</code> — {_h(o.reason)}, line {o.line}"
-            f"{'' if o.may_have_effects else ' (value only: cannot touch data)'}</li>" for o in ep.opaque
-        )
-        opaque_html = f"<h3>Unmodeled operations</h3><ul class=\"compact\">{opaque_items}</ul>"
 
     assumptions_html = ""
     if res.assumptions:
@@ -429,13 +482,6 @@ def _html_finding(res, policy) -> str:
             for key in sorted(res.provenance)
         )
 
-    checks_html = ""
-    if ep.unmodeled_checks:
-        items = "".join(
-            f"<li><code>{_h(check.expression)}</code> — line {check.line}</li>"
-            for check in ep.unmodeled_checks
-        )
-        checks_html = f'<h3>Dropped checks and filters</h3><ul class="compact">{items}</ul>'
 
     principal = ep.principal_binding or "none modeled"
     return (
@@ -450,7 +496,7 @@ def _html_finding(res, policy) -> str:
         '<div class="detail">'
         f"<p><strong>What this means:</strong> {_h(_status_explanation(res))}</p>"
         f"<p><strong>Principal:</strong> {_h(principal)} via {_h(ep.principal_via)}</p>"
-        f"{review_html}{effects_html}{violation_html}{opaque_html}{checks_html}{assumptions_html}"
+        f"{review_html}{_html_helper_trace(res)}{effects_html}{violation_html}{assumptions_html}"
         "</div></details>"
     )
 
@@ -484,7 +530,7 @@ def html_report(results, policy, title: str = "Keyhole security report") -> str:
         (raw_counts["possible_violation"], "Possible violations"),
         (raw_counts["unknown"], "Unknown"),
         (proof_complete, "Proof-complete"),
-        (no_effects, "No modeled effects"),
+        (no_effects, "Endpoints with zero extracted accesses"),
         (incomplete, "Partial models"),
     ]
     metrics_html = "".join(
@@ -504,7 +550,7 @@ def html_report(results, policy, title: str = "Keyhole security report") -> str:
         <p>Start with coverage, then inspect findings. A proof applies to the extracted model (AIR), so a green result is
         meaningful only when the endpoint is fully modeled and its policy is confirmed.</p>
         <div class="guide-grid">
-          <div class="legend-item"><strong>Possible violation</strong><br>Lean found a denied access path, but an earlier opaque helper may block it.</div>
+          <div class="legend-item"><strong>Possible violation</strong><br>Lean found a model counterexample. Its listed blockers explain why the endpoint requires review.</div>
           <div class="legend-item"><strong>VIOLATION (modeled)</strong><br>A modeled effect has a Lean-checked counterexample. Extraction and policy remain trusted inputs.</div>
           <div class="legend-item"><strong>Unknown</strong><br>Unsupported code prevented a complete authorization decision. This is not safe and not a vulnerability claim.</div>
           <div class="legend-item"><strong>Safe (assumed)</strong><br>The proof works only if an unconfirmed policy or helper summary is accurate.</div>
