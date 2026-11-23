@@ -2068,15 +2068,19 @@ class _FunctionAnalyzer:
             # `x = Model.model_validate(data, update={...})`: a new, not yet persisted
             # instance.  Fields are known only where `update=` pins them; the call
             # itself is left to be classified for effects like any other call.
-            fields = []
+            fields = {}
             for kw in value.keywords:
                 if kw.arg == "update" and isinstance(kw.value, ast.Dict):
                     for key, item in zip(kw.value.keys, kw.value.values):
-                        if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                            t = self.term(item, query_model=factory_model)
-                            if t is not None:
-                                fields.append(air.eq(air.fld(key.value), t))
-            self.creates[target.id] = {"model": factory_model, "fields": fields, "line": line}
+                        if not isinstance(key, ast.Constant):
+                            # A computed key or **mapping can replace any earlier field.
+                            fields.clear()
+                        elif isinstance(key.value, str):
+                            fields[key.value] = self.term(item, query_model=factory_model)
+            self.creates[target.id] = {
+                "model": factory_model, "line": line,
+                "fields": [air.eq(air.fld(key), term) for key, term in fields.items() if term is not None],
+            }
             return
         if isinstance(value, ast.Call):
             constructor = (_dotted(value.func) or "").split(".")[-1]

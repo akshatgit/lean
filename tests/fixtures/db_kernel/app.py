@@ -301,6 +301,20 @@ async def write_create_owned_attr(payload: DocCreate, session=Depends(get_sessio
     return {"ok": True}
 
 
+@router.post("/write/create-owner-last")
+async def write_create_owner_last(extra: dict, payload: DocCreate, session=Depends(get_session),
+                                  user=Depends(get_current_user)):
+    doc = Doc.model_validate(payload, update={**extra, "owner_id": user.id})
+    session.add(doc)
+
+
+@router.post("/write/create-owner-first")
+async def write_create_owner_first(extra: dict, payload: DocCreate, session=Depends(get_session),
+                                   user=Depends(get_current_user)):
+    doc = Doc.model_validate(payload, update={"owner_id": user.id, **extra})
+    session.add(doc)
+
+
 @router.post("/write/create-unowned")
 async def write_create_unowned(payload: DocCreate, session=Depends(get_session), user=Depends(get_current_user)):
     doc = Doc.model_validate(payload)           # owner comes from nowhere

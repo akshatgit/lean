@@ -27,6 +27,7 @@ def kernel():
 
 
 POSITIVE = [
+    "POST /write/create-owner-last",
     "GET /conditional/imported-and",
     "GET /owned-projection",
     "GET /optional-checked/{doc_id}",
@@ -44,6 +45,7 @@ POSITIVE = [
 ]
 
 NEGATIVE = [
+    ("POST /write/create-owner-first", "create"),
     ("GET /conditional/local-and", "read"),
     ("GET /conditional/local-col", "read"),
     ("GET /optional-bypassed/{doc_id}", "read"),
