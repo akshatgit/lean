@@ -12,6 +12,7 @@ import argparse
 import ast
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 import yaml
@@ -60,8 +61,14 @@ def cmd_scan(args) -> int:
     if args.air_dir:
         d = Path(args.air_dir)
         d.mkdir(parents=True, exist_ok=True)
-        for ep in endpoints:
+        # Stable even if filesystem traversal order changes. A hyphen cannot
+        # occur in the normalized stem, so suffixes cannot collide with stems.
+        occurrences = Counter()
+        for ep in sorted(endpoints, key=lambda e: (e.key, e.file, e.line)):
             name = "".join(c if c.isalnum() else "_" for c in ep.key.lower()).strip("_")
+            occurrences[name] += 1
+            if occurrences[name] > 1:
+                name = f"{name}--{occurrences[name]}"
             (d / f"{name}.json").write_text(json.dumps(ep.to_json(), indent=2))
     results = check_endpoints(endpoints, policy)
     if args.format == "json":
@@ -89,6 +96,13 @@ def cmd_explain(args) -> int:
     matches = [ep for ep in endpoints if ep.key == args.endpoint]
     if not matches:
         print(f"no endpoint {args.endpoint!r}; found:\n  " + "\n  ".join(e.key for e in endpoints))
+        return 2
+    locations = sorted({f"{ep.file}:{ep.line}" for ep in matches})
+    if args.source:
+        matches = [ep for ep in matches if f"{ep.file}:{ep.line}" == args.source]
+    if len(matches) != 1:
+        print(f"Select a handler for {args.endpoint!r} with --source FILE:LINE:\n  "
+              + "\n  ".join(locations), file=sys.stderr)
         return 2
     res = check_endpoints(matches, policy)[0]
     ep = res.endpoint
@@ -225,6 +239,7 @@ def main(argv=None) -> int:
         sp.add_argument("repo")
         if name == "explain":
             sp.add_argument("endpoint", help='e.g. "GET /api/v1/documents/{doc_id}"')
+            sp.add_argument("--source", metavar="FILE:LINE", help="select the handler location shown in the report")
         sp.add_argument("--policy")
         sp.add_argument("--assumptions", help="assumptions file (default: REPO/keyhole.assumptions.yaml)")
         sp.add_argument("--adapter")

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -39,6 +40,26 @@ def test_demo_verdicts(results, key, verdict):
 
 def test_every_endpoint_found(results):
     assert set(results) == set(EXPECTED)
+
+
+def test_cli_distinguishes_colliding_endpoint_labels(tmp_path, monkeypatch, capsys):
+    endpoints = [
+        air.Endpoint("GET", "/health", "cli.py", 10),
+        air.Endpoint("GET", "/health/", "api.py", 20),
+        air.Endpoint("GET", "/health", "api.py", 20),
+    ]
+    policy = load_policy(DEMO / "keyhole.policy.yaml")
+    monkeypatch.setattr("keyhole.cli._load", lambda args: (DEMO, policy, endpoints))
+    assert main(["scan", str(DEMO), "--air-dir", str(tmp_path)]) == 0
+    assert {p.name: json.loads(p.read_text())["source"] for p in tmp_path.iterdir()} == {
+        "get__health.json": "api.py:20",
+        "get__health--2.json": "cli.py:10",
+        "get__health--3.json": "api.py:20",
+    }
+    assert main(["explain", str(DEMO), "GET /health"]) == 2
+    assert "cli.py:10" in capsys.readouterr().err
+    assert main(["explain", str(DEMO), "GET /health", "--source", "cli.py:10"]) == 0
+    assert "(cli.py:10)" in capsys.readouterr().out
 
 
 def test_storage_violation_is_marked_assumed(results):

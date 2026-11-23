@@ -64,6 +64,11 @@ The HTML format is a self-contained, human-readable report. It explains each
 verdict and lets you filter by result, resource, review status, endpoint, or
 source file without a server or external assets.
 
+If multiple handlers share a method and route, `explain` lists their locations.
+Pass `--source FILE:LINE` using the location from the report. For a complete AIR
+snapshot, pass an empty directory to `scan --air-dir DIR`. Routes with colliding
+filenames get numbered suffixes, and every JSON record includes its route and source.
+
 ## How it works
 
 ```
