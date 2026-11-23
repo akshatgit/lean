@@ -26,6 +26,7 @@ def kernel():
 
 
 POSITIVE = [
+    "GET /conditional/sql-and",
     "GET /generic/owned/{doc_id}",       # select(model) with model/columns bound at the call site
     "GET /builder/owned/{doc_id}",       # statement returned by a helper, narrowed by the caller
     "GET /builder/owned-inline",         # session.exec(builder(...)) directly
@@ -38,6 +39,7 @@ POSITIVE = [
 ]
 
 NEGATIVE = [
+    ("GET /conditional/python-and", "read"),
     ("GET /generic/any/{doc_id}", "read"),          # same helper shape, no owner column
     ("GET /generic/mode/{doc_id}", "read"),         # owner filter on one branch of a runtime switch
     ("GET /builder/all/{doc_id}", "read"),          # builder without the owner filter

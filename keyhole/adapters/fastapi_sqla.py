@@ -1335,6 +1335,10 @@ class _FunctionAnalyzer:
                 raise _Unsupported("filter term")
             return air.eq(a, b)
         if isinstance(e, ast.BoolOp):
+            # Python's and/or truth-test operands and return a single operand.
+            # They do not construct SQL AND/OR expressions inside where().
+            if query_model is not None:
+                raise _Unsupported("Python short-circuit expression in SQL filter")
             parts = [self.cond(v, query_model=query_model) for v in e.values]
             return air.and_(*parts) if isinstance(e.op, ast.And) else air.or_(*parts)
         if isinstance(e, ast.BinOp) and isinstance(e.op, (ast.BitAnd, ast.BitOr)):

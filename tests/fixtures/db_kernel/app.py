@@ -90,6 +90,17 @@ async def builder_all(doc_id: int, session=Depends(get_session), user=Depends(ge
 
 # ---------------------------------------------------------------- filters added on one path
 
+@router.get("/conditional/python-and")
+async def python_and(q: str, session=Depends(get_session), user=Depends(get_current_user)):
+    stmt = select(Doc).where((Doc.title == q) and (Doc.owner_id == user.id))
+    return (await session.exec(stmt)).all()
+
+
+@router.get("/conditional/sql-and")
+async def sql_and(q: str, session=Depends(get_session), user=Depends(get_current_user)):
+    stmt = select(Doc).where((Doc.title == q) & (Doc.owner_id == user.id))
+    return (await session.exec(stmt)).all()
+
 @router.get("/conditional/narrowing")
 async def conditional_narrowing(q: str = "", session=Depends(get_session), user=Depends(get_current_user)):
     stmt = select(Doc).where(Doc.owner_id == user.id)
