@@ -243,7 +243,6 @@ _HTML_STYLE = """
   .guide > summary { padding: 13px 0 8px; cursor: pointer; font-size: 16px; font-weight: 750; }
   .guide-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 9px; }
   .legend-item { padding: 10px 12px; border-radius: 7px; background: #f6f8fb; }
-  .reading-order { margin: 10px 0 0; padding-left: 21px; }
   .summary {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
@@ -539,9 +538,6 @@ def html_report(results, policy, title: str = "Keyhole security report") -> str:
     accesses = _access_stats(results)
     states = accesses["endpoints_by_access_state"]
     incomplete = sum(any(o.may_have_effects for o in r.endpoint.opaque) for r in results)
-    proof_complete = sum(
-        bool(r.endpoint.effects) and r.verdict == "safe" for r in results
-    )
     resources = sorted({er.effect.resource for r in results for er in r.effects})
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     provenance = ", ".join(
@@ -553,16 +549,22 @@ def html_report(results, policy, title: str = "Keyhole security report") -> str:
         (raw_counts["violation"], "VIOLATION (modeled)"),
         (raw_counts["possible_violation"], "Possible violations"),
         (raw_counts["unknown"], "Unknown"),
-        (proof_complete, "Proof-complete"),
+        (raw_counts["safe"], "Verified safe"),
+        (raw_counts["safe_assumed"], "Safe (assumed)"),
+        (raw_counts["no_effects"], "No modeled effects"),
+        (raw_counts["no_effects_assumed"], "No modeled effects (assumed)"),
+    ]
+    coverage_metrics = [
         (f'{accesses["by_verdict"].get("safe", 0)} / {accesses["total"]}', "Modeled accesses proved under the supplied policy"),
         (states["all_proved"], "Endpoints with every modeled access proved"),
         (states["none"], "Endpoints with zero extracted accesses"),
         (incomplete, "Partial models"),
     ]
-    metrics_html = "".join(
-        f'<div class="metric"><strong>{number}</strong><span>{_h(label)}</span></div>'
-        for number, label in metrics
-    )
+    def metric_cards(items):
+        return "".join(
+            f'<div class="metric"><strong>{number}</strong><span>{_h(label)}</span></div>'
+            for number, label in items
+        )
     resource_options = "".join(f'<option value="{_h(r)}">{_h(r)}</option>' for r in resources)
     findings = "".join(_html_finding(res, policy) for res in ordered)
     unknown_rate = (100 * incomplete / len(results)) if results else 0
@@ -571,7 +573,7 @@ def html_report(results, policy, title: str = "Keyhole security report") -> str:
         "A Lean verdict proves the extracted AIR, not that extraction from the application was complete."
     )
     guide = """
-      <details class="guide" open>
+      <details class="guide">
         <summary>How to read this report</summary>
         <p>Start with coverage, then inspect findings. A proof applies to the extracted model (AIR), so a green result is
         meaningful only when the endpoint is fully modeled and its policy is confirmed.</p>
@@ -583,13 +585,6 @@ def html_report(results, policy, title: str = "Keyhole security report") -> str:
           <div class="legend-item"><strong>Verified safe</strong><br>Every modeled row access is allowed by the confirmed policy, with no unmodeled operations in the route.</div>
           <div class="legend-item"><strong>No modeled effects</strong><br>No database object access was extracted. Check whether the endpoint is a redirect/health route or hides access behind helpers.</div>
         </div>
-        <ol class="reading-order">
-          <li>Filter to <strong>VIOLATION (modeled)</strong>, then <strong>Possible violations</strong>, and expand a result.</li>
-          <li>Read <strong>Needs review</strong>. These gaps explain why the finding may be a false positive.</li>
-          <li>Compare <strong>Rows touched when</strong> with <strong>Policy allows when</strong>. A violation means the first condition does not guarantee the second.</li>
-          <li>Use the counterexample as a source-review or test lead; do not treat placeholder values such as <code>&lt;v0&gt;</code> as real IDs.</li>
-          <li>Then filter to <strong>Unknown</strong>; these endpoints need adapter support or reviewed helper summaries before they can be assessed.</li>
-        </ol>
       </details>
     """
 
@@ -601,8 +596,9 @@ def html_report(results, policy, title: str = "Keyhole security report") -> str:
         f"<p>Policy provenance: {_h(provenance)}</p>"
         f"<p>{_h(MODEL_TRUST_NOTICE)}</p></header>"
         f'<main><div class="notice"><strong>Coverage warning:</strong> {_h(notice)}</div>'
+        f'<h2>Endpoint verdicts</h2><section class="summary">{metric_cards(metrics)}</section>'
+        f'<h2>Access coverage</h2><section class="summary">{metric_cards(coverage_metrics)}</section>'
         f"{guide}"
-        f'<section class="summary">{metrics_html}</section>'
         '<section class="toolbar" aria-label="Report filters">'
         '<input id="filter-search" type="search" placeholder="Search endpoint, file, or resource…">'
         '<select id="filter-verdict"><option value="">All results</option>'
