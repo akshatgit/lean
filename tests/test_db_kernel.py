@@ -27,6 +27,7 @@ def kernel():
 
 
 POSITIVE = [
+    "GET /optional-checked/{doc_id}",
     "GET /conditional/partial-sql-and",
     "GET /conditional/sql-and",
     "GET /generic/owned/{doc_id}",       # select(model) with model/columns bound at the call site
@@ -41,6 +42,7 @@ POSITIVE = [
 ]
 
 NEGATIVE = [
+    ("GET /optional-bypassed/{doc_id}", "read"),
     ("GET /conditional/partial-sql-or", "read"),
     ("GET /conditional/python-and", "read"),
     ("GET /generic/any/{doc_id}", "read"),          # same helper shape, no owner column

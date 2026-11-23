@@ -90,6 +90,25 @@ async def builder_all(doc_id: int, session=Depends(get_session), user=Depends(ge
 
 # ---------------------------------------------------------------- filters added on one path
 
+@router.get("/optional-checked/{doc_id}")
+async def optional_checked(doc_id: int, skip: bool, session=Depends(get_session), user=Depends(get_current_user)):
+    if skip:
+        return None
+    doc = await session.get(Doc, doc_id)
+    if doc is None or doc.owner_id != user.id:
+        raise HTTPException(status_code=404)
+    return doc
+
+
+@router.get("/optional-bypassed/{doc_id}")
+async def optional_bypassed(doc_id: int, skip: bool, session=Depends(get_session), user=Depends(get_current_user)):
+    doc = await session.get(Doc, doc_id)
+    if skip:
+        return doc
+    if doc is None or doc.owner_id != user.id:
+        raise HTTPException(status_code=404)
+    return doc
+
 @router.get("/nullable-owner/{doc_id}")
 async def nullable_owner(doc_id: int, session=Depends(get_session), user=Depends(get_current_user)):
     doc = await session.get(Doc, doc_id)

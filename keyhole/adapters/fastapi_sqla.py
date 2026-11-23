@@ -761,6 +761,59 @@ class _FunctionAnalyzer:
                 r["effect_id"] = getattr(effect, "_analysis_id", None)
                 r["read_emitted"] = True
         self._sync_row_effects()
+        self._sync_guarded_return()
+
+    def _sync_guarded_return(self):
+        """Recover a checked row on a final load/deny/return path. Earlier returns
+        precede this load, so they impose no constraint on this particular read.
+        Keep the merged locals untouched: the function can still return None."""
+        if len(self.fn.body) < 3 or not self.returned_rows:
+            return
+        load, guard, ret = self.fn.body[-3:]
+        if not (isinstance(load, ast.Assign) and len(load.targets) == 1
+                and isinstance(load.targets[0], ast.Name)
+                and isinstance(guard, ast.If) and not guard.orelse
+                and len(guard.body) == 1 and isinstance(guard.body[0], ast.Raise)
+                and isinstance(ret, ast.Return) and isinstance(ret.value, ast.Name)
+                and ret.value.id == load.targets[0].id):
+            return
+        row = self.returned_rows[-1]
+        if row is None or row.get("line") != load.lineno:
+            return
+        # Match only a fresh direct read from this assignment. A helper's read
+        # may have additional uses inside the helper before its return.
+        value = load.value.value if isinstance(load.value, ast.Await) else load.value
+        if not (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
+                and value.func.attr == "get" and _dotted(value.func.value) in self.db_vars):
+            return
+        # A call in the denial could itself receive the row before the guard
+        # succeeds. Only admit the scalar comparison wrappers we can identify.
+        if self.index is None:
+            return
+        for node in ast.walk(guard.test):
+            if not isinstance(node, (ast.Name, ast.Load, ast.Attribute, ast.Constant, ast.Call,
+                                     ast.Compare, ast.cmpop, ast.BoolOp, ast.boolop,
+                                     ast.UnaryOp, ast.Not)):
+                return
+            if isinstance(node, ast.Call) and not (
+                self.index.purity.identity(self._pctx(), node.func) == ("builtin", "str")
+                and len(node.args) == 1 and not node.keywords
+                and not (isinstance(node.args[0], ast.Name) and node.args[0].id == ret.value.id)
+            ):
+                return
+        denial = guard.body[0]
+        if denial.cause is not None:
+            return
+        if denial.exc is not None:
+            if not (isinstance(denial.exc, ast.Call)
+                    and all(isinstance(arg, ast.Constant) for arg in denial.exc.args)
+                    and all(isinstance(kw.value, ast.Constant) for kw in denial.exc.keywords)
+                    and self._free(denial.exc)):
+                return
+        for effect in self.ep.effects:
+            if (effect.kind == "read" and effect.line == load.lineno
+                    and effect._analysis_id == row.get("effect_id")):
+                effect.guards = list(row["guards"])
 
     def _endpoint_decorators(self):
         """A decorator other than the route registration wraps the handler in code that
