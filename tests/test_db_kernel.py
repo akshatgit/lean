@@ -27,6 +27,7 @@ def kernel():
 
 
 POSITIVE = [
+    "GET /conditional/rebound-principal-exits",
     "POST /write/create-owner-last",
     "GET /conditional/imported-and",
     "GET /owned-projection",
@@ -45,6 +46,7 @@ POSITIVE = [
 ]
 
 NEGATIVE = [
+    ("GET /conditional/rebound-principal", "read"),
     ("GET /conditional/converted-owner", "read"),
     ("POST /write/create-owner-first", "create"),
     ("GET /conditional/local-and", "read"),

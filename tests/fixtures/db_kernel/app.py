@@ -20,6 +20,10 @@ class DocCreate(BaseModel):
     title: str
 
 
+class ActorInput(BaseModel):
+    id: int
+
+
 class Peer(SQLModel, table=True):
     id: int = Field(primary_key=True)
     owner_id: int | None
@@ -229,6 +233,23 @@ async def local_col(session=Depends(get_session), user=Depends(get_current_user)
 @router.get("/conditional/converted-owner")
 async def converted_owner(session=Depends(get_session), user=Depends(get_current_user)):
     return (await session.exec(select(Doc).where(Doc.owner_id == int(user.id)))).all()
+
+
+@router.get("/conditional/rebound-principal")
+async def rebound_principal(replace: bool, payload: ActorInput, session=Depends(get_session),
+                            user=Depends(get_current_user)):
+    if replace:
+        user = payload
+    return (await session.exec(select(Doc).where(Doc.owner_id == user.id))).all()
+
+
+@router.get("/conditional/rebound-principal-exits")
+async def rebound_principal_exits(replace: bool, payload: ActorInput, session=Depends(get_session),
+                                  user=Depends(get_current_user)):
+    if replace:
+        user = payload
+        return []
+    return (await session.exec(select(Doc).where(Doc.owner_id == user.id))).all()
 
 
 @router.get("/conditional/converted-literal")

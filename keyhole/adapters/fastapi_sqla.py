@@ -524,6 +524,7 @@ class _AnalysisState:
     var_types: dict
     updated: set
     unresolved_values: dict
+    principal_rebound: bool
     global_assumed_from: str | None = None
 
 
@@ -665,6 +666,7 @@ class _FunctionAnalyzer:
         self.owner_class = None
         self.path_params = set(re.findall(r"{(\w+)}", route))
         self.principal = None
+        self.principal_rebound = False
         self.db_vars = {"db", "session"}
         self.body_vars = set()
         self.var_types: dict[str, str] = {}
@@ -752,6 +754,7 @@ class _FunctionAnalyzer:
                     looks_like_auth = bool(self.index and self.index.is_principal_dependency(short))
                     self._analyze_dependency(f"<route dependency {i}>", dep_name,
                                              as_principal=looks_like_auth)
+        self.principal_rebound = self.principal in self._untrackable
         falls_through = self._block(self.fn.body)
         terminal_states = list(self.return_states)
         if falls_through:
@@ -918,6 +921,8 @@ class _FunctionAnalyzer:
 
     def _kill(self, name: str):
         """Forget everything tracked about a local that was rebound to something unknown."""
+        if name == self.principal:
+            self.principal_rebound = True
         for table in (self.rows, self.creates, self.queries, self.query_results, self.values,
                       self.var_types):
             table.pop(name, None)
@@ -1144,7 +1149,7 @@ class _FunctionAnalyzer:
             list(self.global_guards), copy.deepcopy(self.rows), copy.deepcopy(self.creates),
             copy.deepcopy(self.queries), copy.deepcopy(self.query_results), copy.deepcopy(self.values),
             dict(self.var_types), set(self.updated), dict(self.unresolved_values),
-            self.global_assumed_from,
+            self.principal_rebound, self.global_assumed_from,
         )
 
     def _restore(self, state: _AnalysisState):
@@ -1157,6 +1162,7 @@ class _FunctionAnalyzer:
         self.var_types = dict(state.var_types)
         self.updated = set(state.updated)
         self.unresolved_values = dict(state.unresolved_values)
+        self.principal_rebound = state.principal_rebound
         self.global_assumed_from = state.global_assumed_from
 
     @staticmethod
@@ -1222,6 +1228,7 @@ class _FunctionAnalyzer:
         if len(states) == 1:
             return copy.deepcopy(states[0])
         merged = copy.deepcopy(states[0])
+        merged.principal_rebound = any(state.principal_rebound for state in states)
         merged.global_guards = self._common_lists([state.global_guards for state in states])
         merged.global_assumed_from = next(
             (state.global_assumed_from for state in states if state.global_assumed_from), None
@@ -1454,7 +1461,7 @@ class _FunctionAnalyzer:
             return value
         if isinstance(e, ast.Attribute) and isinstance(e.value, ast.Name):
             base = e.value.id
-            if base == self.principal:
+            if base == self.principal and not self.principal_rebound:
                 return air.principal(e.attr)
             if base in self.body_vars:
                 name = f"{base}.{e.attr}"
@@ -2008,6 +2015,8 @@ class _FunctionAnalyzer:
             self.var_types.pop(name, None)
             alias_model, alias_column = self.model_aliases.get(name), self.column_aliases.get(name)
             self._assign_name(target, value, line)
+            if name == self.principal:
+                self.principal_rebound = True
             # the parameter no longer holds the model/column it was called with
             if alias_model is not None:
                 self.model_aliases.pop(name, None)
@@ -2412,7 +2421,7 @@ class _FunctionAnalyzer:
             role = "value"
             if isinstance(actual, ast.Name) and actual.id in self.db_vars:
                 role = "db"
-            elif isinstance(actual, ast.Name) and actual.id == self.principal:
+            elif isinstance(actual, ast.Name) and actual.id == self.principal and not self.principal_rebound:
                 role = "principal"
             elif isinstance(actual, ast.Name) and actual.id in self.rows:
                 role = f"row:{self.rows[actual.id]['model']}"
@@ -2783,7 +2792,7 @@ class _FunctionAnalyzer:
             else:                   # param_attr: [formal, attribute] -- principal only
                 formal, attr = tvalue
                 actual = bound.get(formal)
-                if not (isinstance(actual, ast.Name) and self.principal and actual.id == self.principal):
+                if not (isinstance(actual, ast.Name) and actual.id == self.principal and not self.principal_rebound):
                     return None     # the helper was not given the caller
                 terms.append(air.principal(attr))
         return air.eq(*terms)
