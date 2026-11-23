@@ -1,12 +1,32 @@
 """Every call besides the owner-checked load is PROVABLY unable to touch the database,
 by import identity, receiver type, or transitive closure.  These routes must be SAFE."""
 import anyio
+from asyncio import to_thread
+from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
 
 from .lib import Formatter, describe, even_helper, get_current_user, get_session, logger, slugify
 from .models import Doc, DocOut
 
 router = APIRouter()
+
+ASSET = Path("asset.bin")
+
+
+def load_asset():
+    with ASSET.open("rb") as stream:
+        return stream.read()
+
+
+@router.get("/thread-file")
+async def thread_file():
+    return await to_thread(load_asset)
+
+
+@router.get("/unknown-reader")
+def unknown_reader(provider):
+    with provider.open("rb") as stream:
+        return stream.read()
 
 
 @router.get("/asset-exists")

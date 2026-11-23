@@ -313,6 +313,10 @@ class _Ctx:
                     self._bind(arg.arg, "other")
         elif isinstance(node, ast.ClassDef):
             self._bind(node.name, "other")
+        elif isinstance(node, ast.With):
+            for item in node.items:
+                if isinstance(item.optional_vars, ast.Name):
+                    self._bind(item.optional_vars.id, "with", item.context_expr)
         elif isinstance(node, ast.Assign):
             if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
                 self._bind(node.targets[0].id, "assign", (node.value, None))
@@ -344,7 +348,7 @@ class _Ctx:
     def finalize(self):
         """A simple-assignment target is recorded twice (assign + store); drop the echo."""
         for name, items in self.bindings.items():
-            assigns = sum(1 for kind, _ in items if kind in ("assign", "aug"))
+            assigns = sum(1 for kind, _ in items if kind in ("assign", "aug", "with"))
             stores = [item for item in items if item[0] == "store"]
             keep = [item for item in items if item[0] != "store"]
             # every "assign" produced exactly one matching Store name node
@@ -859,6 +863,8 @@ class Purity:
                 first.append(self.ann_type(ctx, payload))
             elif kind == "exact":
                 first.append(payload)
+            elif kind == "with":
+                first.append(self._entered_type(ctx, payload))
             elif kind == "aug":
                 augmented = True
             elif kind == "assign":
@@ -889,6 +895,22 @@ class Purity:
                 ctx.name_types[name] = None
                 return None
         return candidate
+
+    def _entered_type(self, ctx, expr):
+        """A binary reader from a concrete pathlib constructor has a standard __enter__."""
+        if not (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute)
+                and expr.func.attr == "open" and len(expr.args) == 1 and not expr.keywords
+                and isinstance(expr.args[0], ast.Constant) and expr.args[0].value == "rb"):
+            return None
+        receiver = expr.func.value
+        ident = self.identity(ctx, receiver)
+        if ident and ident[0] == "global" and self._unique(ident[1]):
+            module, _, name = ident[1].rpartition(".")
+            receiver = self.module_globals[module, name][0]
+            ctx = self.module_ctx(module)
+        if isinstance(receiver, ast.Call) and self.identity(ctx, receiver.func) == ("ext", "pathlib.Path"):
+            return ("binary_file_reader",)
+        return None
 
     def _global_name_type(self, ctx: _Ctx, name: str):
         ident = self.identity(ctx, ast.Name(id=name, ctx=ast.Load()))
@@ -1383,6 +1405,8 @@ class Purity:
         base = self.etype(ctx, func.value)
         if base is None:
             return False, False
+        if base == ("binary_file_reader",):
+            return attr == "read" and not call.args and not call.keywords, True
         if base[0] == "val":
             if (base[1], attr) in VAL_HIGHER_ORDER_METHODS or not self._kw_guard(ctx, call):
                 return False, True

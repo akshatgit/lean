@@ -50,6 +50,11 @@ def test_filesystem_probe_requires_resolved_anyio_constructor(pure):
     assert effect_opaque(pure["GET /other-exists"])
 
 
+def test_thread_file_reader_requires_known_context_manager(pure):
+    assert pure["GET /thread-file"].verdict == "no_effects"
+    assert effect_opaque(pure["GET /unknown-reader"])
+
+
 # ---- the five known walker-skip endpoints (mirrored) -------------------------------------
 
 # Move 2 changed the contract for these positions: a call in an `if` test, a BoolOp, a
