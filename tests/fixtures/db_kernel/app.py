@@ -3,6 +3,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlmodel import Field, SQLModel, col, func, select, update
+from sqlmodel.ext.asyncio.session import AsyncSession
 
 router = APIRouter()
 
@@ -11,6 +12,7 @@ class Doc(SQLModel, table=True):
     id: int = Field(primary_key=True)
     owner_id: int
     title: str = ""
+    metadata_fields: dict[str, str] = Field(default_factory=dict)
 
 
 class DocCreate(BaseModel):
@@ -45,6 +47,25 @@ def get_session(): ...
 @router.get("/ticket/{number}")
 async def ticket(number: int, session=Depends(get_session)):
     return await session.get(Ticket, number)
+
+
+@router.get("/owned-projection")
+async def owned_projection(session: AsyncSession = Depends(get_session), user=Depends(get_current_user)):
+    rows = (await session.exec(select(Doc).where(Doc.owner_id == user.id))).all()
+    return [row.metadata_fields.get("title") for row in rows]
+
+
+@router.get("/mixed-projection")
+async def mixed_projection(extra, session: AsyncSession = Depends(get_session), user=Depends(get_current_user)):
+    rows = (await session.exec(select(Doc).where(Doc.owner_id == user.id))).all()
+    rows.append(extra)
+    return [row.metadata_fields.get("title") for row in rows]
+
+
+@router.get("/untyped-projection")
+async def untyped_projection(session=Depends(get_session), user=Depends(get_current_user)):
+    rows = (await session.exec(select(Doc).where(Doc.owner_id == user.id))).all()
+    return [row.metadata_fields.get("title") for row in rows]
 
 
 @router.get("/my-ticket")

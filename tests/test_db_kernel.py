@@ -27,6 +27,7 @@ def kernel():
 
 
 POSITIVE = [
+    "GET /owned-projection",
     "GET /optional-checked/{doc_id}",
     "GET /conditional/partial-sql-and",
     "GET /conditional/sql-and",
@@ -115,6 +116,11 @@ def test_session_get_uses_an_inherited_key_and_widens_composite_lookups(kernel):
     pair = kernel["GET /pair/{number}"]
     assert pair.effects[0].effect.selector is True
     assert any("primary key" in c.expression for c in pair.endpoint.unmodeled_checks)
+
+
+@pytest.mark.parametrize("route", ["GET /mixed-projection", "GET /untyped-projection"])
+def test_comprehension_requires_a_fresh_result_from_a_known_session(kernel, route):
+    assert kernel[route].verdict == "unknown"
 
 
 def test_branch_specific_filters_preserve_owned_or_shared_rows(kernel, tmp_path):

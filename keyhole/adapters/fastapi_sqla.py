@@ -1048,6 +1048,62 @@ class _FunctionAnalyzer:
         for node in self._spine(e):
             self._visited.add(id(node))
 
+    def _projection_calls(self, assignment, stmt):
+        """Type row.field.method() in a comprehension over a freshly fetched
+        list of model instances. Keep the binding inside this comprehension."""
+        if not (isinstance(assignment, ast.Assign) and len(assignment.targets) == 1
+                and isinstance(assignment.targets[0], ast.Name) and isinstance(stmt, ast.Return)
+                and isinstance(stmt.value, ast.ListComp) and len(stmt.value.generators) == 1):
+            return {}
+        rows = assignment.targets[0].id
+        comp = stmt.value
+        gen = comp.generators[0]
+        if (not isinstance(gen.target, ast.Name) or not isinstance(gen.iter, ast.Name)
+                or gen.iter.id != rows or gen.is_async or gen.ifs):
+            return {}
+        # A closure or module-global binding could expose the list to a
+        # callback during iteration even with adjacent assignment and return.
+        if any(
+            isinstance(n, (ast.Global, ast.Nonlocal)) and rows in n.names
+            or isinstance(n, ast.Name) and n.id == rows and n is not assignment.targets[0] and n is not gen.iter
+            for n in ast.walk(self.fn)
+        ):
+            return {}
+        value = assignment.value
+        if not (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
+                and value.func.attr == "all" and not value.args and not value.keywords):
+            return {}
+        execute = value.func.value
+        if isinstance(execute, ast.Await):
+            execute = execute.value
+        if not (isinstance(execute, ast.Call) and isinstance(execute.func, ast.Attribute)
+                and execute.func.attr == "exec" and _dotted(execute.func.value) in self.db_vars
+                and len(execute.args) == 1 and not execute.keywords and id(execute) in self._visited):
+            return {}
+        select = execute.args[0]
+        while (isinstance(select, ast.Call) and isinstance(select.func, ast.Attribute)
+               and select.func.attr in {"where", "order_by", "limit", "offset"}):
+            select = select.func.value
+        purity, ctx = self.index.purity, self._pctx()
+        if purity.etype(ctx, execute.func.value) != ("sqlmodel_session",):
+            return {}
+        if not (isinstance(select, ast.Call) and len(select.args) == 1 and not select.keywords
+                and purity.identity(ctx, select.func) == ("ext", "sqlmodel.select")):
+            return {}
+        entity = purity.identity(ctx, select.args[0])
+        if not entity or entity[0] != "class" or self._model_of(select.args[0]) is None:
+            return {}
+        nodes = list(ast.walk(comp.elt))
+        if any(isinstance(n, (*self._NESTED_SCOPES, ast.NamedExpr)) or
+               isinstance(n, ast.Name) and n.id == rows for n in nodes):
+            return {}
+        scoped = copy.copy(ctx)
+        scoped.name_types = {gen.target.id: ("inst", entity[1])}
+        return {id(n): (scoped, gen.target.id) for n in nodes if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Attribute)
+                and isinstance(n.func.value.value, ast.Name) and n.func.value.value.id == gen.target.id
+                and purity._is_mapped_column(entity[1], n.func.value.attr)}
+
     def _totality_sweep(self):
         """Soundness spine.  Every call in the function body (nested functions, lambdas
         and comprehensions included) that was not positively modeled must be PROVEN
@@ -1058,14 +1114,19 @@ class _FunctionAnalyzer:
         purity, ctx = self.index.purity, self._pctx()
         tainted = frozenset(self._query_names)
         dangerous = self._dangerous_names()
-        for stmt in self.fn.body:
+        for i, stmt in enumerate(self.fn.body):
+            projections = self._projection_calls(self.fn.body[i - 1], stmt) if i else {}
             for node in ast.walk(stmt):
                 if id(node) in self._visited:
                     continue
                 if isinstance(node, ast.Call):
                     if self._session_lifecycle(node):
                         continue
-                    free, deps = purity.call_free_deps(ctx, node, tainted, dangerous)
+                    if id(node) in projections:
+                        scoped, row_name = projections[id(node)]
+                        free, deps = purity.call_free_deps(scoped, node, tainted, dangerous | {row_name})
+                    else:
+                        free, deps = purity.call_free_deps(ctx, node, tainted, dangerous)
                     if not free:
                         name = _dotted(node.func) or ast.unparse(node.func)[:80]
                         self._opaque(f"{name}(...)", "unvisited_call", node.lineno, node=node)

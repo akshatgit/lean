@@ -877,6 +877,11 @@ class Purity:
         if kind == "class":
             return ("inst", name)
         if kind == "ext":
+            if name in ("sqlmodel.ext.asyncio.session.AsyncSession", "sqlmodel.Session",
+                        "sqlmodel.orm.session.Session") and not self.subclasses.get(name):
+                # Receiver identity only. No session method is effect-free by virtue
+                # of this type: the adapter still has to extract the query.
+                return ("sqlmodel_session",)
             if name in EXT_BASE_OK_EXACT and "Exception" in name:
                 return ("val", "exception")
             if name in TYPING_CONCRETE:
