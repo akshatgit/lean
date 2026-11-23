@@ -67,14 +67,14 @@ def test_ignored_call_in_statement_position_is_amber(prov):
 
 
 def test_ignored_call_in_a_skipped_position_is_amber(prov):
-    # reaches the purity oracle through the totality sweep, not through `_helper`
-    assert_amber(prov[0]["GET /ignored-in-condition/{doc_id}"], "safe_assumed", "declared-free:lookup")
+    # an `if` test: modeled as an expression-position call since move 2
+    assert_amber(prov[0]["GET /ignored-in-condition/{doc_id}"], "safe_assumed", "ignore:lookup")
 
 
 def test_no_effects_resting_on_a_declaration_is_not_clean(prov):
     res = prov[0]["GET /ignored-no-effects/{key}"]
     assert not res.effects
-    assert_amber(res, "no_effects_assumed", "declared-free:lookup")
+    assert_amber(res, "no_effects_assumed", "ignore:lookup")
 
 
 def test_ignored_dependency_is_amber(prov):

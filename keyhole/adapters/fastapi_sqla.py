@@ -28,7 +28,22 @@ from ..summaries import instantiate
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 QUERY_PASSTHROUGH = {"first", "one", "one_or_none", "scalar_one_or_none", "scalar_one",
                      "all", "scalars", "scalar", "unique", "limit", "offset", "order_by",
-                     "options", "distinct"}
+                     "options", "distinct", "fetchall", "fetchone", "mappings"}
+# Statement modifiers that neither change which table is read/written nor widen the set
+# of selected rows.  Ignoring them (and any predicate they carry, e.g. `having`) can only
+# widen the modeled selector.
+# (`returning` is deliberately absent: it makes an UPDATE/DELETE also read the rows.)
+STATEMENT_MODIFIERS = {"join", "outerjoin", "execution_options", "with_for_update", "group_by",
+                       "having", "values", "params", "prefix_with", "with_hint",
+                       "populate_existing", "yield_per"}
+# Classmethods that build a NEW instance of a mapped model from other data.
+MODEL_FACTORIES = {"model_validate", "model_validate_json", "from_orm", "parse_obj",
+                   "model_construct", "construct"}
+# How many helper calls deep a single endpoint is followed.  Recursion is cut by the call
+# stack; repeated helpers are answered from `summary_cache`, so depth costs little.
+MAX_HELPER_DEPTH = 6
+RESULT_METHODS = {"first", "one", "one_or_none", "scalar_one_or_none", "scalar_one", "all",
+                  "scalars", "scalar", "fetchall", "fetchone", "mappings"}
 # site-packages/dist-packages: an environment checked out inside the repository is
 # third-party code, not the application.  Treating it as "repository source" would let
 # the adapter resolve application calls into unrelated installed packages.
@@ -482,6 +497,9 @@ class _HelperAnalysis:
     returned_row: dict | None
     row_guards: dict[str, list] = field(default_factory=dict)
     assumptions: dict = field(default_factory=dict)
+    # The statement a statement-builder helper returns (built, not executed), if every
+    # return path returns one for the same model.
+    returned_query: object = None
 
 
 @dataclass
@@ -496,6 +514,13 @@ class _AnalysisState:
     updated: set
     unresolved_values: dict
     global_assumed_from: str | None = None
+
+
+def falls_only_by_return(fn) -> bool:
+    """False if the function can end by falling off its last statement (returning None
+    instead of a statement).  Conservative: the last statement must be a return/raise."""
+    body = fn.body
+    return bool(body) and isinstance(body[-1], (ast.Return, ast.Raise))
 
 
 def find_models(trees) -> set:
@@ -631,6 +656,17 @@ class _FunctionAnalyzer:
         self.returned_rows: list[dict | None] = []
         self.dependency_params: list[tuple[str, str, str]] = []  # (param, dependency, module)
         self.unverified_principals: list[tuple[str, str, str]] = []  # name-matched principals
+        # Helper parameters bound, at the call site being inlined, to a model class
+        # (`model=Flow`) or to one of its columns (`owner_column=Flow.user_id`).
+        self.model_aliases: dict[str, str] = {}
+        self.column_aliases: dict[str, tuple[str, str]] = {}
+        # Statement-builder support: per `return`, the unexecuted query it returns (or
+        # None) and the call nodes that built it; and, in a caller, the statements
+        # obtained from builder helpers, keyed by call node.
+        self.returned_queries: list = []
+        self._returned_query_spines: list = []
+        self.returned_query = None
+        self._helper_queries: dict[int, object] = {}
         # Effects that exist only because a principal dependency fetched the caller.
         self._principal_effect_ids: set[int] = set()
         self.return_states: list[_AnalysisState] = []
@@ -683,6 +719,7 @@ class _FunctionAnalyzer:
             terminal_states.append(self._snapshot())
         if terminal_states:
             self._restore(self._merge_states(terminal_states))
+        self._finalize_returned_query()
         self._totality_sweep()
         self._finalize_returned_row()
         for var, r in self.rows.items():
@@ -771,7 +808,45 @@ class _FunctionAnalyzer:
                       self.var_types):
             table.pop(name, None)
         self.updated.discard(name)
+        self.model_aliases.pop(name, None)
+        self.column_aliases.pop(name, None)
         self._forget_fields_of(name)
+
+    def _model_of(self, node) -> str | None:
+        """The mapped model a statement-entity expression denotes: `Flow`, `Flow.id`, or
+        a helper parameter bound to one of those at the call site."""
+        if isinstance(node, ast.Name):
+            if node.id in self.model_aliases:
+                return self.model_aliases[node.id]
+            if node.id in self.column_aliases:
+                return self.column_aliases[node.id][0]
+            return node.id if node.id in self.models and not self._is_local(node.id) else None
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            base = node.value.id
+            if base in self.model_aliases:
+                return self.model_aliases[base]
+            return base if base in self.models and not self._is_local(base) else None
+        return None
+
+    def _is_local(self, name: str) -> bool:
+        return (name in self.rows or name in self.creates or name in self.values
+                or name in self.queries or name in self.query_results or name in self.ep.params)
+
+    def _entities(self, args) -> set[str]:
+        """Every mapped model mentioned anywhere in a select()/update()/delete() argument
+        list, including inside `func.count(Model.id)`-style expressions."""
+        found = set()
+        for arg in args:
+            for sub in ast.walk(arg):
+                if isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name):
+                    model = self._model_of(sub)
+                    if model:
+                        found.add(model)
+                elif isinstance(sub, ast.Name):
+                    model = self._model_of(sub)
+                    if model:
+                        found.add(model)
+        return found
 
     def _forget_fields_of(self, row_var: str):
         """`owner = doc.owner_id` is a field of the row `doc` held at that time.  Once
@@ -798,8 +873,8 @@ class _FunctionAnalyzer:
                 names.update(a.asname or a.name.split(".")[0] for a in sub.names)
         return names
 
-    _NARROWING_ONLY = {"filter", "where", "filter_by", "join", "outerjoin", "execution_options",
-                       "limit", "offset", "order_by", "options", "distinct"}
+    _NARROWING_ONLY = {"filter", "where", "filter_by", "limit", "offset", "order_by", "options",
+                       "distinct"} | STATEMENT_MODIFIERS
 
     def _loop_narrowed_queries(self, loop) -> set[str]:
         """Query variables a loop only ever rebinds as `q = q.<narrowing method>(...)`.
@@ -955,33 +1030,41 @@ class _FunctionAnalyzer:
             (state.global_assumed_from for state in states if state.global_assumed_from), None
         )
 
-        row_names = set().union(*(state.rows for state in states))
+        # A name survives a join only if EVERY path binds it.  If one path left it
+        # unbound (never assigned there, or rebound to something unmodeled) then after
+        # the join it may hold anything, and the binding of the other path must not
+        # answer for it.
+        def bound_everywhere(table):
+            return set.intersection(*(set(getattr(state, table)) for state in states))
+
+        row_names = bound_everywhere("rows")
         merged.rows = {}
         for name in row_names:
             bindings = [state.rows[name] for state in states if name in state.rows]
             merged.rows[name] = self._merge_row_bindings(bindings)
 
-        create_names = set().union(*(state.creates for state in states))
+        create_names = bound_everywhere("creates")
         merged.creates = {}
         for name in create_names:
             variants = [state.creates[name] for state in states if name in state.creates]
             item = copy.deepcopy(variants[0])
-            item["fields"] = self._common_lists([variant["fields"] for variant in variants])
-            merged.creates[name] = item
+            if all(variant["model"] == item["model"] for variant in variants):
+                item["fields"] = self._common_lists([variant["fields"] for variant in variants])
+                merged.creates[name] = item
 
-        query_names = set().union(*(state.queries for state in states))
+        query_names = bound_everywhere("queries")
         merged.queries = {}
         for name in query_names:
             variants = [state.queries[name] for state in states if name in state.queries]
             item = copy.deepcopy(variants[0])
-            if all(variant.model == item.model for variant in variants):
+            if all(variant.model == item.model and variant.terminal == item.terminal
+                   for variant in variants):
                 item.conds = self._common_lists([variant.conds for variant in variants])
                 item.executed = all(variant.executed for variant in variants)
                 item.effect_emitted = all(variant.effect_emitted for variant in variants)
-                item.terminal = item.terminal if all(v.terminal == item.terminal for v in variants) else None
                 merged.queries[name] = item
 
-        result_names = set().union(*(state.query_results for state in states))
+        result_names = bound_everywhere("query_results")
         merged.query_results = {}
         for name in result_names:
             variants = [state.query_results[name] for state in states if name in state.query_results]
@@ -1027,6 +1110,22 @@ class _FunctionAnalyzer:
                     if "selector" in row:
                         effect.selector = row["selector"]
                     effect.assumed_from = effect.assumed_from or row.get("assumed_from")
+
+    def _finalize_returned_query(self):
+        """A statement-builder helper: every return hands back an unexecuted statement
+        for the same model and kind.  Its conditions are those common to all returns.
+        Only then are the builder calls accounted for (the caller receives the
+        statement); otherwise they stay unvisited for the totality sweep."""
+        queries = self.returned_queries
+        if not queries or any(q is None for q in queries) or not falls_only_by_return(self.fn):
+            return
+        first = queries[0]
+        if any(q.model != first.model or q.terminal != first.terminal for q in queries):
+            return
+        self.returned_query = _QueryState(
+            first.model, self._common_lists([q.conds for q in queries]), first.terminal)
+        for spine in self._returned_query_spines:
+            self._visited.update(spine)
 
     def _finalize_returned_row(self):
         if not self.returned_rows or any(row is None for row in self.returned_rows):
@@ -1138,6 +1237,11 @@ class _FunctionAnalyzer:
             return air.const(e.value)
         if isinstance(e, ast.Name) and e.id in self.ep.params:
             return air.param(e.id)
+        if isinstance(e, ast.Name) and e.id in self.column_aliases:
+            model, attr = self.column_aliases[e.id]
+            if query_model is None:
+                return _FieldTerm(attr, "?")      # outside a query it names no row
+            return _FieldTerm(attr, None) if model == query_model else None
         if isinstance(e, ast.Name) and e.id in self.values:
             value = self.values[e.id]
             if query_model is not None and "field" in value:
@@ -1151,6 +1255,11 @@ class _FunctionAnalyzer:
                 name = f"{base}.{e.attr}"
                 self.ep.params.setdefault(name, air.Param(name, "body", "other"))
                 return air.param(name)
+            if base in self.model_aliases and base not in self.rows and base not in self.creates:
+                model = self.model_aliases[base]
+                if query_model is None:
+                    return _FieldTerm(e.attr, "?")
+                return _FieldTerm(e.attr, None) if model == query_model else None
             if base in self.models:
                 if query_model is not None and base != query_model:
                     return None
@@ -1254,26 +1363,30 @@ class _FunctionAnalyzer:
         f = e.func
         dotted = _dotted(f)
         if isinstance(f, ast.Name) and f.id in ("select", "delete", "update") and e.args:
-            target = _dotted(e.args[0]) or ""
-            model = target.split(".", 1)[0]
-            if model not in self.models:
+            # The statement touches every mapped model its arguments mention, whether
+            # directly (`select(Flow)`, `select(Flow.id)`), inside an expression
+            # (`select(func.count(Flow.id))`) or through a helper parameter bound to a
+            # model at the call site (`select(model)`).  A query state describes exactly
+            # one model: with several (`select(A, B)`) it stays unrecognised, and with
+            # none (`select(func.count())`) it waits for `.select_from(Model)`.
+            entities = self._entities(e.args)
+            if len(entities) > 1:
                 return None
-            # `select(A, B)` reads rows of both models; a query state describes one.
-            # Leave it unrecognised so it is reported as unmodeled rather than as A only.
-            entities = {(_dotted(arg) or "").split(".", 1)[0] for arg in e.args}
-            if len(entities & self.models) > 1:
-                return None
+            if f.id != "select" and self._model_of(e.args[0]) is None:
+                return None   # update()/delete() must name their table directly
             terminal = f.id if f.id in ("delete", "update") else None
-            return _QueryState(model, terminal=terminal)
+            return _QueryState(next(iter(entities)) if entities else None, terminal=terminal)
         if not isinstance(f, ast.Attribute):
-            return None
+            return self._helper_query(e)
         recv = _dotted(f.value)
         if f.attr == "query" and recv in self.db_vars and e.args:
-            model = _dotted(e.args[0])
-            return _QueryState(model) if model in self.models else None
+            if len(self._entities(e.args)) != 1:
+                return None
+            model = self._model_of(e.args[0])
+            return _QueryState(model) if model else None
         if f.attr == "get" and recv in self.db_vars and len(e.args) >= 2:
-            model = _dotted(e.args[0])
-            if model not in self.models:
+            model = self._model_of(e.args[0]) if isinstance(e.args[0], ast.Name) else None
+            if model is None:
                 return None
             state = _QueryState(model, executed=True)
             self._mark_unresolved_uses(e.args[1], "row selector")
@@ -1283,39 +1396,47 @@ class _FunctionAnalyzer:
             return state
         if f.attr in ("execute", "scalars", "scalar", "exec") and recv in self.db_vars and e.args:
             state = self.query(e.args[0])
-            if state:
-                state.executed = True
+            if state is None or state.model is None:
+                return None   # a statement whose table we do not know is not modeled
+            state.executed = True
             return state
 
         state = self.query(f.value)
         if state is None:
-            return None
+            return self._helper_query(e)   # `repo.build_statement(...)`
+        if f.attr == "select_from":
+            # `select(func.count()).select_from(Model)`: names the table of a statement
+            # that had none.  Anything else (a second table, a subquery) is not modeled.
+            target = self._model_of(e.args[0]) if len(e.args) == 1 else None
+            if state.model is not None or target is None or state.conds:
+                return None
+            state.model = target
+            return state
+        if state.model is None:
+            return None       # no table yet: nothing below can be interpreted
         if f.attr in ("filter", "where"):
-            if self.conditional_depth == 0:
-                for condition in e.args:
-                    try:
-                        state.conds.append(self.cond(condition, query_model=state.model))
-                    except _Unsupported:
-                        self.ep.unmodeled_checks.append(
-                            air.UnmodeledCheck(f"query filter dropped: {ast.unparse(condition)[:120]}", e.lineno)
-                        )
-            else:
-                self.ep.unmodeled_checks.append(
-                    air.UnmodeledCheck(f"conditional query filter dropped: {ast.unparse(e)[:120]}", e.lineno)
-                )
+            # A filter added on one path constrains that path only.  The analysis is
+            # path-sensitive and a join keeps only the conditions common to every path
+            # (`_merge_states`), so it is applied here whatever the nesting.
+            for condition in e.args:
+                try:
+                    state.conds.append(self.cond(condition, query_model=state.model))
+                except _Unsupported:
+                    self.ep.unmodeled_checks.append(
+                        air.UnmodeledCheck(f"query filter dropped: {ast.unparse(condition)[:120]}", e.lineno)
+                    )
         elif f.attr == "filter_by":
-            if self.conditional_depth == 0:
-                for kw in e.keywords:
-                    term = self.term(kw.value, query_model=state.model)
-                    if kw.arg and term is not None:
-                        state.conds.append(air.eq(air.fld(kw.arg), term))
+            for kw in e.keywords:
+                term = self.term(kw.value, query_model=state.model)
+                if kw.arg and term is not None:
+                    state.conds.append(air.eq(air.fld(kw.arg), term))
         elif f.attr in ("delete", "update"):
             state.terminal = f.attr
             state.executed = True
         elif f.attr in QUERY_PASSTHROUGH:
-            if f.attr in {"first", "one", "one_or_none", "scalar_one_or_none", "scalar_one", "all", "scalars", "scalar"}:
+            if f.attr in RESULT_METHODS:
                 state.executed = True
-        elif f.attr in {"join", "outerjoin", "execution_options"}:
+        elif f.attr in STATEMENT_MODIFIERS:
             pass
         else:
             return None
@@ -1428,14 +1549,61 @@ class _FunctionAnalyzer:
         self._restore(self._merge_states(fallthrough))
         return True
 
+    _NESTED_SCOPES = (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp,
+                      ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+    def _model_calls_in(self, exprs, line):
+        """Model every not-yet-modeled call that is evaluated as part of these expressions.
+
+        The statement handlers only model a call when it IS the statement, the assigned
+        value or the returned value.  A call sitting anywhere else (an `if` test, an
+        operand of `and`/`or`, a subscripted or unpacked result, a dict/list display, an
+        argument nested in an expression, a `with` item, a loop iterable) still runs, at
+        this point, under exactly the guards established so far.  Its result is not
+        bound to anything: only its effects and opaques are recorded, with the current
+        path guards.  Emitting it even if short-circuiting would skip it over-approximates.
+
+        Lambdas, comprehensions and nested functions are separate scopes that run later
+        or repeatedly with their own bindings; they are left to the totality sweep."""
+        todo = [e for e in exprs if e is not None]
+        calls = []
+        while todo:
+            node = todo.pop(0)
+            if isinstance(node, self._NESTED_SCOPES):
+                continue
+            if isinstance(node, ast.Call):
+                calls.append(node)
+            todo.extend(ast.iter_child_nodes(node))
+        for call in calls:  # outermost first: a modeled chain marks its own inner calls
+            if id(call) not in self._visited:
+                self._expr_effects(call, getattr(call, "lineno", line))
+
     def _stmt(self, s):
+        """Analyze one statement, then model the calls its own expressions contain that
+        the statement handler did not consume (see `_model_calls_in`)."""
+        falls_through = self._stmt_inner(s)
+        if isinstance(s, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Expr, ast.Return,
+                          ast.Raise, ast.Assert, ast.Delete)):
+            own = [getattr(s, "value", None), getattr(s, "exc", None), getattr(s, "cause", None),
+                   getattr(s, "test", None), getattr(s, "msg", None)]
+            if isinstance(s, (ast.Assign, ast.Delete)):
+                own.extend(s.targets)            # `cache[await key(session)] = ...`
+            elif isinstance(s, (ast.AnnAssign, ast.AugAssign)):
+                own.append(s.target)
+            self._model_calls_in(own, s.lineno)
+        return falls_through
+
+    def _stmt_inner(self, s):
         # A walrus anywhere in this statement rebinds its target to an unmodeled value.
         for sub in ast.walk(s):
             if isinstance(sub, ast.NamedExpr) and isinstance(sub.target, ast.Name):
                 self._kill(sub.target.id)
         if isinstance(s, ast.If):
+            self._model_calls_in([s.test], s.lineno)   # evaluated before either branch
             return self._analyze_if(s)
         if isinstance(s, (ast.With, ast.AsyncWith, ast.For, ast.AsyncFor, ast.While)):
+            if isinstance(s, (ast.For, ast.AsyncFor)):
+                self._model_calls_in([s.iter], s.lineno)   # evaluated once, before the loop
             if isinstance(s, (ast.For, ast.AsyncFor, ast.While)):
                 # The body is analyzed once, from the loop-entry state.  Anything the
                 # loop rebinds may hold a later iteration's value on entry, so forget it
@@ -1444,6 +1612,10 @@ class _FunctionAnalyzer:
                 for name in self._stored_names(s):
                     if name not in narrowed:
                         self._kill(name)
+                if isinstance(s, ast.While):
+                    # re-evaluated on every iteration: only after the loop-assigned
+                    # names have been forgotten
+                    self._model_calls_in([s.test], s.lineno)
                 base = self._snapshot()
                 self._restore(base)
                 self._block(s.body, conditional=True)
@@ -1451,6 +1623,7 @@ class _FunctionAnalyzer:
                 # Zero iterations is always possible; only facts common with the entry survive.
                 self._restore(self._merge_states([base, body]))
             else:
+                self._model_calls_in([item.context_expr for item in s.items], s.lineno)
                 for item in s.items:
                     if item.optional_vars is not None:
                         for name in self._stored_names(item.optional_vars):
@@ -1520,6 +1693,14 @@ class _FunctionAnalyzer:
                 if isinstance(value, ast.Name) and value.id in self.rows:
                     returned = copy.deepcopy(self.rows[value.id])
                 self._expr_effects(s.value, s.lineno)
+                built = self.query(value) if isinstance(value, (ast.Call, ast.Name)) else None
+                if built is not None and not built.executed and built.model is not None:
+                    self.returned_queries.append(built)
+                    self._returned_query_spines.append([id(n) for n in self._spine(value)])
+                else:
+                    self.returned_queries.append(None)
+            else:
+                self.returned_queries.append(None)
             self.returned_rows.append(returned)
             self.return_states.append(self._snapshot())
             return False
@@ -1549,7 +1730,13 @@ class _FunctionAnalyzer:
             tables = (self.rows, self.creates, self.queries, self.query_results, self.values)
             before = [table.get(name) for table in tables]
             self.var_types.pop(name, None)
+            alias_model, alias_column = self.model_aliases.get(name), self.column_aliases.get(name)
             self._assign_name(target, value, line)
+            # the parameter no longer holds the model/column it was called with
+            if alias_model is not None:
+                self.model_aliases.pop(name, None)
+            if alias_column is not None:
+                self.column_aliases.pop(name, None)
             # A binding the assignment did not replace is stale: the name now holds
             # something else.  Never let the old row/query/value answer for it.
             for table, old in zip(tables, before):
@@ -1610,6 +1797,21 @@ class _FunctionAnalyzer:
                       if kw.arg and (t := self.term(kw.value, query_model=_dotted(value.func))) is not None]
             self.creates[target.id] = {"model": _dotted(value.func), "fields": fields, "line": line}
             return
+        factory_model = self._new_instance_model(value)
+        if factory_model:
+            # `x = Model.model_validate(data, update={...})`: a new, not yet persisted
+            # instance.  Fields are known only where `update=` pins them; the call
+            # itself is left to be classified for effects like any other call.
+            fields = []
+            for kw in value.keywords:
+                if kw.arg == "update" and isinstance(kw.value, ast.Dict):
+                    for key, item in zip(kw.value.keys, kw.value.values):
+                        if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                            t = self.term(item, query_model=factory_model)
+                            if t is not None:
+                                fields.append(air.eq(air.fld(key.value), t))
+            self.creates[target.id] = {"model": factory_model, "fields": fields, "line": line}
+            return
         if isinstance(value, ast.Call):
             constructor = (_dotted(value.func) or "").split(".")[-1]
             if constructor in CONTAINER_TYPES:
@@ -1644,6 +1846,11 @@ class _FunctionAnalyzer:
         if var in self.creates:
             self._visited.add(id(target))
             t = self.term(value, query_model=self.creates[var]["model"])
+            # The last assignment wins: an earlier value for this field no longer holds.
+            self.creates[var]["fields"] = [
+                known for known in self.creates[var]["fields"]
+                if not (isinstance(known, dict) and "eq" in known
+                        and known["eq"][0].get("field") == target.attr)]
             if t is not None:
                 self.creates[var]["fields"].append(air.eq(air.fld(target.attr), t))
         elif var in self.rows:
@@ -1654,6 +1861,47 @@ class _FunctionAnalyzer:
                 r = self.rows[var]
                 self.updated.add(var)
                 self._emit("update", r["model"], r["selector"], list(r["guards"]), line, r["assumed_from"])
+
+    def _new_instance_model(self, value) -> str | None:
+        """Model name if `value` is `Model.<factory>(source, ...)` and the result is
+        certainly a NEW instance.  Pydantic returns the very object it is given when that
+        object already is an instance of the class, so the source must be provably
+        something else (a schema object or plain data), not possibly a loaded row."""
+        if not (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
+                and value.func.attr in MODEL_FACTORIES and isinstance(value.func.value, ast.Name)
+                and self.index is not None):
+            return None
+        model = self._model_of(value.func.value)
+        if model is None or value.func.value.id in self.model_aliases:
+            return None
+        if value.func.attr in ("model_validate", "from_orm", "parse_obj"):
+            if not value.args or len(value.args) != 1:
+                return None
+            purity = self.index.purity
+            source = purity.etype(self._pctx(), value.args[0])
+            if source is None:
+                return None
+            if source[0] == "inst" and purity._may_be_model_instance(source[1]):
+                return None
+            if source[0] not in ("inst", "val"):
+                return None
+        return model
+
+    def _static_model(self, node) -> str | None:
+        """Model name if `node` is a variable whose declared/constructed type is exactly
+        one mapped model (no mapped subclass it could be instead)."""
+        if not isinstance(node, ast.Name) or self.index is None:
+            return None
+        purity = self.index.purity
+        typ = purity.etype(self._pctx(), node)
+        if typ is None or typ[0] != "inst" or typ[1] not in purity.class_defs:
+            return None
+        name = purity.class_defs[typ[1]][1].name
+        if name not in self.models or not purity.is_model_class(typ[1]):
+            return None
+        if any(purity.is_model_class(sub) for sub in purity._descendants(typ[1])):
+            return None
+        return name
 
     @staticmethod
     def _returns_row(value):
@@ -1826,10 +2074,51 @@ class _FunctionAnalyzer:
 
     def _analyze_repo_helper(self, ref, var, call, line, skip_first: bool = False) -> bool:
         qualified = ".".join(x for x in (ref.module, ref.owner_class, ref.node.name) if x)
-        if self.depth >= 3 or qualified in self.call_stack:
+        if self.depth >= MAX_HELPER_DEPTH or qualified in self.call_stack:
             self._opaque(f"{qualified}(...)", "recursion_or_depth_limit", line)
             return True
+        analysis, bound = self._helper_analysis(ref, call, skip_first)
+        self._apply_helper_analysis(analysis, bound, var, line)
+        if analysis.returned_query is not None:
+            # The helper hands back a statement that nothing here tracks: whoever
+            # executes it does so outside the model.
+            self._opaque(f"{qualified}(...)", "returned_statement_untracked", line)
+        return bool(analysis.effects or analysis.opaque or analysis.returned_row or analysis.row_guards
+                    or analysis.returned_query)
 
+    def _helper_query(self, call):
+        """If `call` is a statement-builder helper (an identified, undecorated repository
+        function every return path of which returns an unexecuted statement for one
+        model), inline it once and return that statement, instantiated with the call's
+        arguments.  Otherwise None, with no side effect: the call is then classified by
+        the normal paths."""
+        if id(call) in self._helper_queries:
+            state = self._helper_queries[id(call)]
+            return copy.deepcopy(state)
+        ref, bound_method = self._strict_ref(call)
+        if ref is None or not self.index.purity._decorators_ok(ref.module, ref.node, ref.owner_class):
+            return None
+        qualified = ".".join(x for x in (ref.module, ref.owner_class, ref.node.name) if x)
+        if self.depth >= MAX_HELPER_DEPTH or qualified in self.call_stack:
+            return None
+        analysis, bound = self._helper_analysis(ref, call, bound_method)
+        if analysis.returned_query is None:
+            return None
+        line = getattr(call, "lineno", self.fn.lineno)
+        self._apply_helper_analysis(analysis, bound, "_ret", line)
+        state = copy.deepcopy(analysis.returned_query)
+        # A condition whose helper-parameter terms cannot be expressed here widens to True.
+        conds = [self._substitute_pred(c, bound) for c in state.conds]
+        state.conds = [c for c in conds if c is not True]
+        state.executed = False
+        state.effect_emitted = False
+        self._helper_queries[id(call)] = state
+        return copy.deepcopy(state)
+
+    def _helper_analysis(self, ref, call, skip_first: bool = False):
+        """(analysis, bound): the helper's summary for this call's argument roles.  Pure
+        with respect to this analyzer's endpoint; see `_apply_helper_analysis`."""
+        qualified = ".".join(x for x in (ref.module, ref.owner_class, ref.node.name) if x)
         bound = self._bound_arguments(ref.node, call, skip_first)
         if any(isinstance(a, ast.Starred) for a in call.args) or any(k.arg is None for k in call.keywords):
             # *args/**kwargs at the call site: positional binding is unknown, so helper
@@ -1846,6 +2135,14 @@ class _FunctionAnalyzer:
             elif isinstance(actual, ast.Name) and actual.id in self.rows:
                 role = f"row:{self.rows[actual.id]['model']}"
                 has_row_arg = True
+            elif isinstance(actual, ast.Name) and self._model_of(actual):
+                # the helper is parametric in the model: `fetch(session, Flow, ...)`
+                role = (f"column:{self.column_aliases[actual.id][0]}.{self.column_aliases[actual.id][1]}"
+                        if actual.id in self.column_aliases else f"model:{self._model_of(actual)}")
+            elif (isinstance(actual, ast.Attribute) and isinstance(actual.value, ast.Name)
+                    and self._model_of(actual) and actual.value.id not in self.rows
+                    and actual.value.id not in self.creates):
+                role = f"column:{self._model_of(actual)}.{actual.attr}"   # `owner_column=Flow.user_id`
             roles.append((name, role))
         # The child's analysis is a function of the argument roles and, for row
         # arguments, of the state each row is seeded with (model, selector, guards).
@@ -1877,6 +2174,13 @@ class _FunctionAnalyzer:
                     child.ep.principal_binding = name
                     child.ep.principal_via = "external"
                     child.ep.params.pop(name, None)
+                elif role.startswith("model:"):
+                    child.model_aliases[name] = role.split(":", 1)[1]
+                    child.ep.params.pop(name, None)
+                elif role.startswith("column:"):
+                    model, _, attr = role.split(":", 1)[1].partition(".")
+                    child.column_aliases[name] = (model, attr)
+                    child.ep.params.pop(name, None)
                 elif role.startswith("row:"):
                     actual = bound[name]
                     source = self.rows[actual.id]
@@ -1898,9 +2202,12 @@ class _FunctionAnalyzer:
                 copy.deepcopy(child.ep.effects), copy.deepcopy(child.ep.opaque),
                 copy.deepcopy(child.ep.unmodeled_checks), copy.deepcopy(child.returned_row),
                 copy.deepcopy(row_guards), dict(child.ep.assumptions),
+                copy.deepcopy(child.returned_query),
             )
             self.index.summary_cache[cache_key] = copy.deepcopy(analysis)
+        return analysis, bound
 
+    def _apply_helper_analysis(self, analysis, bound, var, line):
         copied_effects = []
         effect_by_child_id = {}
         for effect in analysis.effects:
@@ -1950,7 +2257,6 @@ class _FunctionAnalyzer:
             row["effect"] = effect_by_child_id.get(row.get("effect_id"))
             row["effect_id"] = getattr(row["effect"], "_analysis_id", None)
             self.rows[var] = row
-        return bool(analysis.effects or analysis.opaque or analysis.returned_row or analysis.row_guards)
 
     def _dependency_declaration(self, dep_name, qualified, ref) -> str | None:
         """The ignore_calls entry that may suppress dependency `dep_name`, or None.
@@ -2031,7 +2337,7 @@ class _FunctionAnalyzer:
         if not self.index.purity._decorators_ok(ref.module, ref.node, ref.owner_class):
             self._opaque(f"{qualified}(...)", "decorated_helper", line)
             return
-        if self.depth >= 3 or qualified in self.call_stack:
+        if self.depth >= MAX_HELPER_DEPTH or qualified in self.call_stack:
             self._opaque(f"{qualified}(...)", "recursion_or_depth_limit", line)
             return
         # A dependency's own sub-dependencies run too, and they are parameters, not calls
@@ -2277,12 +2583,27 @@ class _FunctionAnalyzer:
                     self._visited.add(id(call))
                     c = self.creates.pop(var)
                     self._emit("create", c["model"], air.and_(*c["fields"]), list(self.global_guards), line)
+                    if f.attr == "merge":
+                        # merge() is an upsert: with a primary key that already exists it
+                        # overwrites that row, whichever row it is.
+                        self._emit("update", c["model"], True, list(self.global_guards), line)
                     return
                 if f.attr in ("add", "merge") and var in self.rows:
                     # Re-persisting an already-loaded row is a conservative update.
                     self._visited.add(id(call))
                     self._update_row(var, line)
                     return
+                if f.attr in ("add", "merge", "delete") and len(call.args) == 1 and not call.keywords:
+                    model = self._static_model(arg)
+                    if model:
+                        # An object of a known mapped type that we did not see loaded or
+                        # built here.  We know WHICH table is written but not which row,
+                        # nor whether add() inserts or updates: any row, both kinds.
+                        self._visited.add(id(call))
+                        kinds = ("delete",) if f.attr == "delete" else ("create", "update")
+                        for kind in kinds:
+                            self._emit(kind, model, True, list(self.global_guards), line)
+                        return
         self._expr_effects(call, line)
 
     def _expr_effects(self, e, line):

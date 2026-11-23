@@ -47,45 +47,84 @@ def effect_opaque(res):
 
 # ---- the five known walker-skip endpoints (mirrored) -------------------------------------
 
+# Move 2 changed the contract for these positions: a call in an `if` test, a BoolOp, a
+# subscript, an unpacked or splatted result is now MODELED (its effects are extracted and
+# checked) instead of being left as an opaque.  The invariant that matters is unchanged:
+# the hidden access can never be invisible.  It is either a checked effect or an opaque.
 LANGFLOW_SKIP_MIRRORS = [
-    ("GET /files/download/{flow_id}/{file_name}", "_legacy_flow_storage_allowed"),  # BoolOp
-    ("GET /files/list/{flow_id}", "_legacy_flow_storage_allowed"),                  # BoolOp in try
-    ("PUT /migration/destinations/{record_id}", "_state"),                          # dict splat in return
-    ("GET /agentic/check-config", "get_enabled_providers_for_user"),                # tuple unpack
-    ("GET /catalog-policy/usage/flows", "_cached_flow_component_usage"),            # tuple unpack
+    # endpoint, resource the hidden call touches, verdict under the fixture policy
+    ("GET /files/download/{flow_id}/{file_name}", "User", "safe"),     # BoolOp; User.read is open
+    ("GET /files/list/{flow_id}", "User", "safe"),                     # BoolOp in try
+    ("PUT /migration/destinations/{record_id}", "Record", "safe"),     # dict splat; Record.read is open
+    ("GET /agentic/check-config", "Flow", "safe"),                     # tuple unpack; owner-scoped query
+    ("GET /catalog-policy/usage/flows", "Flow", "violation"),          # tuple unpack; reads ALL flows
 ]
 
 
-@pytest.mark.parametrize("key,callee", LANGFLOW_SKIP_MIRRORS)
-def test_langflow_skip_patterns_are_unknown_never_safe(skips, key, callee):
+@pytest.mark.parametrize("key,resource,verdict", LANGFLOW_SKIP_MIRRORS)
+def test_langflow_skip_patterns_are_modeled(skips, key, resource, verdict):
     res = skips[key]
-    assert res.verdict not in NOT_PROVEN
-    assert res.verdict == "unknown"
-    assert any(callee in o.call for o in effect_opaque(res)), [o.call for o in res.endpoint.opaque]
+    assert not effect_opaque(res)
+    assert any(e.effect.resource == resource and e.effect.kind == "read" for e in res.effects), \
+        [(e.effect.kind, e.effect.resource) for e in res.effects]
+    assert res.verdict == verdict
+
+
+def test_langflow_skip_patterns_are_violations_when_the_hidden_access_is_denied(tmp_path):
+    # NEGATIVE: the same code under a policy that forbids the hidden reads.  If the call in
+    # the skipped position were not modeled these would stay green.
+    import shutil
+
+    fixture = tmp_path / "app"
+    shutil.copytree(FIXTURES / "totality_skips", fixture)
+    policy = fixture / "keyhole.policy.yaml"
+    policy.write_text(policy.read_text().replace('read: "true"', 'read: "false"'))
+    from keyhole.adapters import FastAPISQLAlchemyAdapter as Adapter
+    pol = load_policy(policy)
+    results = {r.endpoint.key: r for r in check_endpoints(
+        Adapter().extract(fixture, load_summaries(fixture), policy=pol), pol)}
+    for key in ("GET /files/download/{flow_id}/{file_name}", "GET /files/list/{flow_id}",
+                "PUT /migration/destinations/{record_id}"):
+        # (a dropped validation check earlier in the handler may demote it to a lead)
+        assert results[key].verdict in ("violation", "possible_violation"), key
+        assert any(e.effect.resource in ("User", "Record") and e.verdict != "safe"
+                   for e in results[key].effects), key
 
 
 def test_modeled_part_of_a_skip_endpoint_is_still_proven(skips):
-    # The owner-checked dependency read is modeled and safe; only the skipped call
-    # keeps the endpoint from SAFE.
     res = skips["GET /files/download/{flow_id}/{file_name}"]
-    assert [e.verdict for e in res.effects] == ["safe"]
+    assert sorted((e.effect.resource, e.verdict) for e in res.effects) == [("Flow", "safe"), ("User", "safe")]
 
 
+# Unguarded reads of an owner-only resource in positions the statement handlers do not
+# consume: modeled, hence VIOLATION.
 @pytest.mark.parametrize("key", [
     "GET /skip/if-test/{flow_id}", "GET /skip/ifexp/{flow_id}", "GET /skip/subscript/{flow_id}",
-    "GET /skip/comprehension", "GET /skip/for-iter", "GET /skip/with-item",
-    "DELETE /skip/closure/{flow_id}", "GET /skip/lambda/{flow_id}", "GET /skip/kwarg/{flow_id}",
-    "GET /skip/fstring/{flow_id}", "GET /skip/raise/{flow_id}",
-    "GET /skip/unresolved-dependency/{flow_id}",
+    "GET /skip/for-iter", "GET /skip/kwarg/{flow_id}", "GET /skip/fstring/{flow_id}",
+    "GET /skip/raise/{flow_id}",
 ])
-def test_every_catalogued_skip_position_is_unknown(skips, key):
+def test_unguarded_access_in_an_expression_position_is_a_violation(skips, key):
+    res = skips[key]
+    assert res.verdict == "violation"
+    assert any(e.effect.resource == "Flow" and e.verdict == "violation" for e in res.effects)
+
+
+# Separate scopes (comprehension, lambda, nested function), a handle the adapter cannot
+# identify, and an unreadable dependency are still not modeled: they must stay UNKNOWN.
+@pytest.mark.parametrize("key", [
+    "GET /skip/comprehension", "GET /skip/with-item", "DELETE /skip/closure/{flow_id}",
+    "GET /skip/lambda/{flow_id}", "GET /skip/unresolved-dependency/{flow_id}",
+])
+def test_unmodeled_scope_is_unknown(skips, key):
     res = skips[key]
     assert res.verdict == "unknown"
     assert effect_opaque(res)
 
 
-def test_no_endpoint_in_the_skip_fixture_is_safe(skips):
-    assert not [k for k, r in skips.items() if r.verdict in NOT_PROVEN]
+def test_no_hidden_access_in_the_skip_fixture_is_invisible(skips):
+    for key, res in skips.items():
+        assert res.verdict != "no_effects", key
+        assert res.effects or effect_opaque(res), key
 
 
 # ---- purity must come from identity / receiver type / closure, never a method name -------
