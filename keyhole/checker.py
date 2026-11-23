@@ -91,7 +91,7 @@ def check_endpoints(endpoints: list, policy: Policy) -> list:
         # a guard or an identity fact can only make a counterexample harder to find; a
         # violation that survives them needs no demotion.
         suppressions = sorted(key for key in res.provenance
-                              if key.startswith(("ignore:", "declared-free:")))
+                              if key.startswith(("ignore:", "declared-free:", "assume:")))
         for j, e in enumerate(ep.effects):
             r = verdicts[f"{i}:{j}"]
             verdict = r["verdict"]
@@ -139,16 +139,19 @@ def _aggregate(res: EndpointResult, ep: Endpoint) -> str:
     # is reported as its own `no_effects` state and never counted as SAFE.
     # The provenance set gates every green verdict, effects or not: "nothing to check"
     # that holds only because a call was declared irrelevant is not a clean result.
+    # A REVIEWED assumption (digests over claim and target still match) has the standing
+    # of a confirmed policy: it is recorded and shown, but it does not make a result amber.
+    unreviewed = [key for key in res.provenance if not key.startswith("reviewed:")]
     if not res.effects:
         if incomplete:
             return "unknown"
-        return "no_effects_assumed" if res.provenance else "no_effects"
+        return "no_effects_assumed" if unreviewed else "no_effects"
     worst = "safe"
     for er in res.effects:
         if RANK[er.verdict] > RANK[worst]:
             worst = er.verdict
     if incomplete and RANK[worst] < RANK["unknown"]:
         worst = "unknown"
-    if worst == "safe" and (res.provenance or res.assumptions):
+    if worst == "safe" and unreviewed:
         worst = "safe_assumed"
     return worst

@@ -133,10 +133,24 @@ class Opaque:
     #                      effects may be incomplete (blocks SAFE / no_effects).
     may_block: bool = True
     may_have_effects: bool = True
+    # What an assumption would have to name to make this opaque go away: the callee's
+    # resolved symbol, or `function :: callee text` for a call site with no identity.
+    target: str | None = None
+    origin: str | None = None     # file:line where the unmodeled call is written
+    # Symbols of the helper calls (innermost first) through which this opaque reached the
+    # endpoint.  An assumption on any of them accounts for it as well.
+    via: tuple = ()
 
     def to_json(self) -> dict:
-        return {"call": self.call, "reason": self.reason, "line": self.line,
+        data = {"call": self.call, "reason": self.reason, "line": self.line,
                 "may_block": self.may_block, "may_have_effects": self.may_have_effects}
+        if self.target:
+            data["target"] = self.target
+        if self.origin:
+            data["origin"] = self.origin
+        if self.via:
+            data["via"] = list(self.via)
+        return data
 
 
 @dataclass

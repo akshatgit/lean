@@ -264,6 +264,10 @@ class _Ctx:
         self.owner = owner            # qualified name of the enclosing class, if a method
         self.bindings: dict[str, list] = {}
         self.name_types: dict[str, object] = {}
+        # Provenance of the typing done in this function: ids of `returns_type`
+        # assumptions any inferred type here rests on.  Types are memoised per name, so
+        # the dependency is kept per function and never cleared.
+        self.type_deps: set = set()
         self.self_name = None
         self.cls_name = None
         if fn is not None:
@@ -350,9 +354,11 @@ class _Ctx:
 
 
 class Purity:
-    def __init__(self, index, models: set[str], policy=None):
+    def __init__(self, index, models: set[str], policy=None, assumptions=None):
         self.index = index
         self.models = models
+        # keyhole.assumptions.yaml: bound by resolved identity, see `assumption_for`.
+        self.assumptions = assumptions
         # Calls the user explicitly declared data-irrelevant in the policy file.  They are
         # bound and screened by `declaration_for`, never matched here by bare name.
         self.declared_free = set(getattr(policy, "ignored_calls", ()) or ())
@@ -406,6 +412,8 @@ class Purity:
                 if ident and ident[0] in ("class", "builtin", "ext"):
                     self.subclasses.setdefault(ident[1], set()).add(q)
             self.bases[q] = resolved
+        if self.assumptions:
+            self.assumptions.resolve(self)   # digests + standing of every entry
 
     # ---------------------------------------------------------------- indexing
     def _index_module(self, module: str, tree):
@@ -884,9 +892,16 @@ class Purity:
 
     def _global_name_type(self, ctx: _Ctx, name: str):
         ident = self.identity(ctx, ast.Name(id=name, ctx=ast.Load()))
-        return self._identity_value_type(ident)
+        return self._identity_value_type(ident, ctx)
 
-    def _identity_value_type(self, ident):
+    def _identity_value_type(self, ident, ctx=None):
+        result = self._identity_value_type_inner(ident)
+        if ctx is not None and ident is not None and ident[0] == "global":
+            # a module global typed through an assumption taints whoever reads it
+            ctx.type_deps |= self.module_ctx(ident[1].rpartition(".")[0]).type_deps
+        return result
+
+    def _identity_value_type_inner(self, ident):
         if ident is None:
             return None
         kind, qualified = ident
@@ -998,7 +1013,7 @@ class Purity:
         if isinstance(e, ast.Attribute):
             ident = self.identity(ctx, e)
             if ident is not None:
-                return self._identity_value_type(ident)
+                return self._identity_value_type(ident, ctx)
             base_ident = self.identity(ctx, e.value)
             if base_ident and base_ident[0] == "class":
                 if self._is_mapped_column(base_ident[1], e.attr):
@@ -1050,6 +1065,17 @@ class Purity:
         return False
 
     def _call_type(self, ctx: _Ctx, call: ast.Call, awaited: bool):
+        if self.assumptions and not self.__dict__.get("_typing_assumption"):
+            self._typing_assumption = True   # binding a call types its receiver: no re-entry
+            try:
+                entry = self.assumption_for(ctx, call, "returns_type")
+            finally:
+                self._typing_assumption = False
+            if entry is not None and entry.claim in self.class_defs:
+                # Resolution fact: "this call returns an instance of that class".  From
+                # here on the adapter analyses the class's real method bodies.
+                ctx.type_deps.add(entry.key)
+                return ("inst", entry.claim)
         ident = self.identity(ctx, self._callee(ctx, call))
         if ident is not None:
             kind, name = ident
@@ -1215,6 +1241,7 @@ class Purity:
                         node.ctx, (ast.Store, ast.Del)):
                     if not self.store_free(ctx, node):
                         return False
+        self._note(ctx.type_deps)   # every type this proof leaned on, however it was inferred
         return True
 
     def store_free(self, ctx: _Ctx, target) -> bool:
@@ -1300,6 +1327,13 @@ class Purity:
             # Explicit user declaration (policy adapter.ignore_calls): NOT a proof.  The
             # id travels with the verdict through every cache and every caller.
             self._note({f"declared-free:{key}"})
+            return True, False
+        claim = self.assumption_for(ctx, call, "effects", self._extra_dangerous)
+        if claim is not None and claim.claim == [] and self.irrelevance_refusal(
+                ctx, call, claim.id, self._extra_dangerous) is None:
+            # `effects: []` from the assumptions file: an assumption (or a reviewed fact),
+            # recorded under its id wherever this verdict travels.
+            self._note({claim.key})
             return True, False
         # No declaration, or a refused one: classify the call on its own merits.  A
         # refused declaration contributes nothing -- the oracle must prove it or not.
@@ -1544,31 +1578,101 @@ class Purity:
         key = self.binding_key(ctx, call, self.declared_free)
         if key is None:
             return None, None
+        return key, self.irrelevance_refusal(ctx, call, key, dangerous)
+
+    # ---------------------------------------------------------------- assumptions file
+    def call_symbol(self, ctx: _Ctx, call: ast.Call) -> str | None:
+        """Resolved identity of the callee: a qualified function/class/external name, or
+        `<qualified class>.<method>` for a method on a receiver of known class.  None when
+        the callee has no static identity (it can then only be named as a `site`)."""
+        func = self._callee(ctx, call)
+        ident = self.identity(ctx, func)
+        if ident is not None:
+            return ident[1] if ident[0] in ("func", "class", "ext", "global") else None
+        if isinstance(func, ast.Attribute):
+            base_ident = self.identity(ctx, func.value)
+            if base_ident and base_ident[0] == "class":
+                return f"{base_ident[1]}.{func.attr}"
+            base = self.etype(ctx, func.value)
+            if base is not None and base[0] == "inst":
+                return f"{base[1]}.{func.attr}"
+        return None
+
+    @staticmethod
+    def enclosing_symbol(ctx: _Ctx) -> str | None:
+        if ctx.fn is None:
+            return None
+        return f"{ctx.owner or ctx.module}.{ctx.fn.name}"
+
+    def call_target(self, ctx: _Ctx, call: ast.Call) -> str:
+        """What an assumption has to name to cover this call."""
+        return self.call_symbol(ctx, call) or (
+            f"{self.enclosing_symbol(ctx)} :: {ast.unparse(call.func)}")
+
+    def _kernel_call(self, ctx: _Ctx, call: ast.Call, dangerous=frozenset()) -> bool:
+        """The database kernel is adapter semantics: no assumption ever applies to a call
+        on a session/db/query receiver or to a statement constructor."""
+        func = self._callee(ctx, call)
+        ident = self.identity(ctx, func)
+        if ident and ident[0] == "ext" and ident[1].split(".")[0] in ("sqlalchemy", "sqlmodel"):
+            return True
+        if isinstance(func, ast.Attribute):
+            recv = dotted(func.value)
+            bad = set(dangerous) | self._db_like_names(ctx) | {"db", "session"}
+            if recv and (recv in bad or recv.split(".")[0] in bad
+                         or recv.split(".")[-1] in ("db", "session")):
+                return True
+        return False
+
+    def assumption_for(self, ctx: _Ctx, call: ast.Call, kind: str, dangerous=frozenset()):
+        """The entry of the assumptions file that makes a `kind` claim about THIS call, or
+        None.  Binding is by exact call site or by the callee's resolved identity; an
+        unresolvable target, a short name or another module's namesake never binds."""
+        entries = self.assumptions
+        if not entries or ctx is None:
+            return None
+        entry = None
+        if entries.by_site and ctx.fn is not None:
+            entry = entries.by_site.get(
+                (self.enclosing_symbol(ctx), ast.unparse(call.func)), {}).get(kind)
+        if entry is None and entries.by_symbol:
+            symbol = self.call_symbol(ctx, call)
+            if symbol is not None:
+                entry = entries.by_symbol.get(symbol, {}).get(kind)
+        if entry is None or entry.status == "unbound":
+            return None
+        if self._kernel_call(ctx, call, dangerous):
+            return None
+        return entry
+
+    def irrelevance_refusal(self, ctx: _Ctx, call: ast.Call, key: str, dangerous=frozenset()):
+        """Why a "this call touches no data" claim must NOT apply at this call site, or
+        None when it may.  Shared by policy ignore_calls and `effects: []` assumptions."""
         for module, node, cls in (self.dispatch_targets(ctx, call) or []):
             ref = SimpleNamespace(module=module, node=node, file="",
                                   owner_class=cls.rsplit(".", 1)[-1] if cls else None)
             if self.index.function_may_touch_db(ref):
-                return key, f"{key} is declared data-irrelevant but visibly reads or writes the database"
+                return f"{key} is declared data-irrelevant but visibly reads or writes the database"
         bad = set(dangerous) | self._db_like_names(ctx)
         func = self._callee(ctx, call)
         if isinstance(func, ast.Attribute):
             recv = dotted(func.value)
             if recv and (recv in bad or recv.split(".")[0] in bad):
-                return key, f"{key} is called on a database handle, live query or tracked row"
+                return f"{key} is called on a database handle, live query or tracked row"
         for kw in call.keywords:
             if kw.arg in HIGHER_ORDER_KW and not isinstance(kw.value, ast.Constant):
-                return key, f"{key} is handed a callback ({kw.arg}=)"
+                return f"{key} is handed a callback ({kw.arg}=)"
         for value in [*call.args, *(kw.value for kw in call.keywords)]:
             for node in ast.walk(value):
                 if isinstance(node, ast.Lambda):
-                    return key, f"{key} is handed a callable"
+                    return f"{key} is handed a callable"
                 if not isinstance(node, ast.Name):
                     continue
                 if node.id in bad:
-                    return key, f"{key} is handed {node.id} (a database handle, live query or tracked row)"
+                    return f"{key} is handed {node.id} (a database handle, live query or tracked row)"
                 if node.id in self.models:
-                    return key, f"{key} is handed the model class {node.id}"
+                    return f"{key} is handed the model class {node.id}"
                 ident = self.identity(ctx, node)
                 if ident and ident[0] in ("func", "localfn"):
-                    return key, f"{key} is handed a callable ({node.id})"
-        return key, None
+                    return f"{key} is handed a callable ({node.id})"
+        return None

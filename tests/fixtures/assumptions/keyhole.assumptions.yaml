@@ -1,0 +1,44 @@
+schema: 1
+assumptions:
+  - id: A-LOCATOR-TYPE
+    target: {symbol: app.get_doc_service}
+    claim: {returns_type: app.DocService}
+    evidence: {file: app.py, note: "the 'docs' registry entry is DocService"}
+  - id: A-LOCATOR-FX
+    target: {symbol: app.get_doc_service}
+    claim: {effects: []}
+    evidence: {file: app.py, note: "the lookup builds an object; it touches no table"}
+  - id: A-EMIT
+    target: {symbol: vendor.emit}
+    claim: {effects: []}
+    evidence: {note: "metrics sink"}
+  - id: A-VENDOR-LOAD
+    target: {symbol: vendor.load_document, params: [session, doc_id]}
+    claim:
+      effects:
+        - kind: read
+          resource: Doc
+          selector: {eq: [{field: id}, {param: doc_id}]}
+    evidence: {note: "SELECT * FROM doc WHERE id = :doc_id"}
+  - id: A-ENSURE-OWNER
+    target: {symbol: app.ensure_owner}
+    claim:
+      ensures:
+        row: {param: owner_id}
+        guard: {eq: [{field: owner_id}, {param_attr: [user, id]}]}
+    evidence: {file: app.py, quote: "if not _same(owner_id, user.id): raise"}
+  - id: A-WRONG-MODULE
+    target: {symbol: other.ensure_owner}
+    claim:
+      ensures:
+        row: {param: owner_id}
+        guard: {eq: [{field: owner_id}, {param_attr: [user, id]}]}
+    evidence: {note: "names other.ensure_owner, which app.py never calls"}
+  - id: A-ACTOR
+    target: {symbol: app.get_actor}
+    claim: {principal: true}
+    evidence: {file: app.py, note: "returns the authenticated actor"}
+  - id: A-ACTOR-FX
+    target: {symbol: vendor.actor_from_request}
+    claim: {effects: []}
+    evidence: {note: "decodes a token"}

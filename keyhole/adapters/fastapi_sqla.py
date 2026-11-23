@@ -137,7 +137,8 @@ class _FunctionRef:
 class _RepoIndex:
     """Cross-file aliases, imports, and functions used by the adapter."""
 
-    def __init__(self, repo: Path, parsed: list[tuple[Path, ast.AST]], models: set[str], policy=None):
+    def __init__(self, repo: Path, parsed: list[tuple[Path, ast.AST]], models: set[str], policy=None,
+                 assumptions=None):
         self.repo = repo
         self.models = models
         self.modules: dict[str, tuple[Path, ast.AST]] = {}
@@ -180,7 +181,8 @@ class _RepoIndex:
         self._index_router_auth(parsed)
         # Effect-freedom oracle (see purity.py): the only authority allowed to say a
         # call cannot touch the database.
-        self.purity = Purity(self, models, policy)
+        self.assumptions = assumptions
+        self.purity = Purity(self, models, policy, assumptions)
 
     @staticmethod
     def dependency_names(node) -> set[str]:
@@ -423,6 +425,15 @@ class _RepoIndex:
             }:
                 self.relevance_cache[qualified] = True
                 return True
+            # A mapped model class handed to a method call (`s.get(Doc, id)`,
+            # `conn.query(Doc)`) is a database access whatever the handle is called --
+            # the session may come from a factory under any name.  Plain type tests
+            # (isinstance/issubclass/type) are not.
+            if isinstance(call.func, ast.Attribute) and short not in {"isinstance", "issubclass"} \
+                    and any((_dotted(arg) or "").split(".", 1)[0] in self.models
+                            for arg in [*call.args, *(kw.value for kw in call.keywords)]):
+                self.relevance_cache[qualified] = True
+                return True
             child = self.resolve_function(ref.module, name, owner_class=ref.owner_class)
             if child is not None and self.function_may_touch_db(child, seen):
                 self.relevance_cache[qualified] = True
@@ -548,7 +559,8 @@ class FastAPISQLAlchemyAdapter:
                 return 1.0
         return 0.0
 
-    def extract(self, repo: Path, summaries: dict, *, include_tests: bool = False, policy=None) -> list:
+    def extract(self, repo: Path, summaries: dict, *, include_tests: bool = False, policy=None,
+                assumptions=None) -> list:
         parsed = []
         for p in _python_files(repo, include_tests=include_tests):
             try:
@@ -556,7 +568,8 @@ class FastAPISQLAlchemyAdapter:
             except SyntaxError:
                 continue
         models = find_models(t for _, t in parsed)
-        index = _RepoIndex(repo, parsed, models, policy)
+        index = _RepoIndex(repo, parsed, models, policy, assumptions)
+        self.last_index = index   # for `keyhole review` / `keyhole worklist`
         endpoints = []
         for path, tree in parsed:
             module = _module_name(repo, path)
@@ -721,6 +734,11 @@ class _FunctionAnalyzer:
             self._restore(self._merge_states(terminal_states))
         self._finalize_returned_query()
         self._totality_sweep()
+        if self.index is not None and self.index.assumptions:
+            # Any type this function's analysis used that came from a `returns_type`
+            # assumption (which bodies were inlined, which calls were proven free).
+            for key in sorted(self._pctx().type_deps):
+                self._assume_entry_key(key)
         self._finalize_returned_row()
         for var, r in self.rows.items():
             if not r.get("read_emitted"):
@@ -792,15 +810,33 @@ class _FunctionAnalyzer:
         grows: nothing downstream may clear or overwrite an entry."""
         self.ep.assumptions.setdefault(key, reason)
 
+    def _assume_entry(self, entry):
+        self._assume(entry.key, entry.describe())
+
+    def _assume_entry_key(self, key: str):
+        entry = self.index.assumptions.get(key.split(":", 1)[1]) if self.index.assumptions else None
+        self._assume(key, entry.describe() if entry else key)
+
     def _assume_declared(self, deps):
         for key in deps:
+            if key.startswith(("assume:", "reviewed:")):
+                self._assume_entry_key(key)     # an entry of the assumptions file
+                continue
             name = key.split(":", 1)[1]
             self._assume(key, f"call {name} is declared data-irrelevant in the policy "
                               f"(adapter.ignore_calls); a call was treated as effect-free on that basis")
 
-    def _opaque(self, call: str, reason: str, line: int, *, effects: bool = True, block: bool = True):
-        if not any(o.call == call and o.reason == reason and o.line == line for o in self.ep.opaque):
-            self.ep.opaque.append(air.Opaque(call, reason, line, block, effects))
+    def _opaque(self, call: str, reason: str, line: int, *, effects: bool = True, block: bool = True,
+                node=None, target: str | None = None):
+        """Record an unmodeled operation.  `node` (the call) or `target` says what an
+        assumption would have to name to cover it; `keyhole worklist` groups by that."""
+        if any(o.call == call and o.reason == reason and o.line == line for o in self.ep.opaque):
+            return
+        origin = None
+        if node is not None and self.index is not None:
+            target = target or self.index.purity.call_target(self._pctx(), node)
+            origin = f"{self.ep.file}:{getattr(node, 'lineno', line)}"
+        self.ep.opaque.append(air.Opaque(call, reason, line, block, effects, target, origin))
 
     def _kill(self, name: str):
         """Forget everything tracked about a local that was rebound to something unknown."""
@@ -950,7 +986,7 @@ class _FunctionAnalyzer:
                     free, deps = purity.call_free_deps(ctx, node, tainted, dangerous)
                     if not free:
                         name = _dotted(node.func) or ast.unparse(node.func)[:80]
-                        self._opaque(f"{name}(...)", "unvisited_call", node.lineno)
+                        self._opaque(f"{name}(...)", "unvisited_call", node.lineno, node=node)
                     self._assume_declared(deps)
                 elif (isinstance(node, (ast.Attribute, ast.Subscript))
                         and isinstance(node.ctx, (ast.Store, ast.Del))):
@@ -1155,6 +1191,14 @@ class _FunctionAnalyzer:
                 dep_module = self.index.annotation_dependency_module(
                     self.module, arg.annotation) or self.module
             policy_dep = self.policy and dep in self.policy.principal_dependencies
+            if dep and self.index is not None and self.index.assumptions:
+                # `principal: true` in the assumptions file, bound by the dependency's
+                # resolved identity: "this dependency returns the authenticated caller".
+                claimed = self.index.assumptions.by_symbol.get(
+                    self.index.resolve_name(dep_module, dep), {}).get("principal")
+                if claimed is not None and claimed.status != "unbound":
+                    policy_dep = True
+                    self._assume_entry(claimed)
             policy_type = self.policy and annotation_name in self.policy.principal_types
             superuser_dep = self.policy and dep in self.policy.superuser_dependencies
             superuser_type = self.policy and annotation_name in self.policy.superuser_types
@@ -2075,10 +2119,11 @@ class _FunctionAnalyzer:
     def _analyze_repo_helper(self, ref, var, call, line, skip_first: bool = False) -> bool:
         qualified = ".".join(x for x in (ref.module, ref.owner_class, ref.node.name) if x)
         if self.depth >= MAX_HELPER_DEPTH or qualified in self.call_stack:
-            self._opaque(f"{qualified}(...)", "recursion_or_depth_limit", line)
+            self._opaque(f"{qualified}(...)", "recursion_or_depth_limit", line, target=qualified)
             return True
         analysis, bound = self._helper_analysis(ref, call, skip_first)
-        self._apply_helper_analysis(analysis, bound, var, line)
+        self._apply_helper_analysis(analysis, bound, var, line,
+                                    self.index.purity.call_target(self._pctx(), call))
         if analysis.returned_query is not None:
             # The helper hands back a statement that nothing here tracks: whoever
             # executes it does so outside the model.
@@ -2105,7 +2150,8 @@ class _FunctionAnalyzer:
         if analysis.returned_query is None:
             return None
         line = getattr(call, "lineno", self.fn.lineno)
-        self._apply_helper_analysis(analysis, bound, "_ret", line)
+        self._apply_helper_analysis(analysis, bound, "_ret", line,
+                                    self.index.purity.call_target(self._pctx(), call))
         state = copy.deepcopy(analysis.returned_query)
         # A condition whose helper-parameter terms cannot be expressed here widens to True.
         conds = [self._substitute_pred(c, bound) for c in state.conds]
@@ -2207,7 +2253,7 @@ class _FunctionAnalyzer:
             self.index.summary_cache[cache_key] = copy.deepcopy(analysis)
         return analysis, bound
 
-    def _apply_helper_analysis(self, analysis, bound, var, line):
+    def _apply_helper_analysis(self, analysis, bound, var, line, symbol=None):
         copied_effects = []
         effect_by_child_id = {}
         for effect in analysis.effects:
@@ -2227,8 +2273,9 @@ class _FunctionAnalyzer:
             if child_id is not None:
                 effect_by_child_id[child_id] = copied
         for opaque in analysis.opaque:
-            self.ep.opaque.append(air.Opaque(opaque.call, opaque.reason, line, opaque.may_block,
-                                             opaque.may_have_effects))
+            self.ep.opaque.append(air.Opaque(
+                opaque.call, opaque.reason, line, opaque.may_block, opaque.may_have_effects,
+                opaque.target, opaque.origin, (*opaque.via, symbol) if symbol else opaque.via))
         for check in analysis.unmodeled_checks:
             self.ep.unmodeled_checks.append(air.UnmodeledCheck(check.expression, line))
         for key, reason in analysis.assumptions.items():
@@ -2393,8 +2440,9 @@ class _FunctionAnalyzer:
             if child_id is not None:
                 id_map[child_id] = copied
         for opaque in child.ep.opaque:
-            self.ep.opaque.append(air.Opaque(opaque.call, opaque.reason, line, opaque.may_block,
-                                             opaque.may_have_effects))
+            self.ep.opaque.append(air.Opaque(
+                opaque.call, opaque.reason, line, opaque.may_block, opaque.may_have_effects,
+                opaque.target, opaque.origin, (*opaque.via, qualified)))
         for check in child.ep.unmodeled_checks:
             self.ep.unmodeled_checks.append(air.UnmodeledCheck(check.expression, line))
         for key, reason in child.ep.assumptions.items():
@@ -2445,6 +2493,115 @@ class _FunctionAnalyzer:
                 todo.extend(node)
         return False
 
+    # ---------- assumptions file: claims about one call ----------
+    def _claim(self, call, kind):
+        if self.index is None or not self.index.assumptions:
+            return None
+        return self.index.purity.assumption_for(self._pctx(), call, kind, self._dangerous_names())
+
+    def _claim_bindings(self, entry, call):
+        """formal -> actual argument for the claim's target, or None when the call's
+        arguments cannot be matched to formals with certainty."""
+        if any(isinstance(a, ast.Starred) for a in call.args) or any(k.arg is None for k in call.keywords):
+            return None
+        ref, bound_method = self._strict_ref(call)
+        if ref is not None:
+            return self._bound_arguments(ref.node, call, bound_method)
+        bound = {kw.arg: kw.value for kw in call.keywords}
+        if call.args:
+            if entry.params is None or len(call.args) > len(entry.params):
+                return None    # positional arguments of a callee whose formals we do not know
+            bound.update(dict(zip(entry.params, call.args)))
+        return bound
+
+    def _claim_pred(self, pred, bound, *, resource=None, row=None):
+        """Instantiate a claim predicate at this call.  None = some term cannot be bound
+        here, in which case the claim does not apply at all (fail closed)."""
+        if pred is True or pred is False:
+            return pred
+        (kind, value), = pred.items()
+        if kind in ("and", "or"):
+            parts = [self._claim_pred(part, bound, resource=resource, row=row) for part in value]
+            if any(part is None for part in parts):
+                return None
+            return air.and_(*parts) if kind == "and" else air.or_(*parts)
+        terms = []
+        for term in value:          # eq
+            (tkind, tvalue), = term.items()
+            if tkind == "field":
+                terms.append(_FieldTerm(tvalue, row) if row else air.fld(tvalue))
+            elif tkind == "const":
+                terms.append(air.const(tvalue))
+            elif tkind == "param":
+                actual = bound.get(tvalue)
+                t = self.term(actual, query_model=resource) if actual is not None else None
+                if t is None or "field" in t:
+                    return None     # not expressible, or a field of some other row
+                terms.append(t)
+            else:                   # param_attr: [formal, attribute] -- principal only
+                formal, attr = tvalue
+                actual = bound.get(formal)
+                if not (isinstance(actual, ast.Name) and self.principal and actual.id == self.principal):
+                    return None     # the helper was not given the caller
+                terms.append(air.principal(attr))
+        return air.eq(*terms)
+
+    def _apply_effects_claim(self, call, display_name, line) -> bool:
+        """`effects:` claim: the listed effects are an exhaustive upper bound of what the
+        call touches.  True when the call is thereby fully accounted for."""
+        entry = self._claim(call, "effects")
+        if entry is None:
+            return False
+        purity = self.index.purity
+        if entry.claim == []:
+            # "touches no mapped table": never at a call site that hands it the means to
+            # (session, live query, tracked row, model class, callable), never when the
+            # in-repo body visibly does.
+            if purity.irrelevance_refusal(self._pctx(), call, entry.id, self._dangerous_names()):
+                return False
+            self._assume_entry(entry)
+            return True
+        bound = self._claim_bindings(entry, call)
+        effects = []
+        for item in entry.claim:
+            if item["resource"] not in self.models:
+                return False        # names a table this scan does not know
+            selector = self._claim_pred(item.get("selector", True), bound or {},
+                                        resource=item["resource"])
+            if selector is None:
+                return False        # unbindable: the call stays unmodeled (opaque)
+            effects.append((item["kind"], item["resource"], selector))
+        for kind, resource, selector in effects:
+            self._emit(kind, resource, selector, list(self.global_guards), line)
+        self._assume_entry(entry)
+        return True
+
+    def _apply_ensures_claim(self, call):
+        """`ensures:` claim: on every normal return, GUARD holds for the row passed as
+        ON.  Attached to that row only, and only if every formal the guard mentions is
+        bound here -- in particular `param_attr` needs the endpoint's principal."""
+        entry = self._claim(call, "ensures")
+        if entry is None:
+            return
+        bound = self._claim_bindings(entry, call)
+        if bound is None:
+            return
+        actual = bound.get(entry.claim["row"]["param"])
+        row = None
+        if isinstance(actual, ast.Name) and actual.id in self.rows:
+            row = actual.id
+        elif actual is not None:
+            source = self.term(actual)       # `flow.user_id`: a field of the tracked row `flow`
+            if isinstance(source, _FieldTerm) and source.row in self.rows:
+                row = source.row
+        if row is None:
+            return
+        guard = self._claim_pred(entry.claim["guard"], bound, row=row)
+        if guard is None or guard is True:
+            return
+        self.rows[row]["guards"].append(guard)
+        self._assume_entry(entry)
+
     def _strict_ref(self, call):
         """The single repository definition `call` dispatches to, identified by import
         resolution or receiver type (never by method name alone).  None when the callee
@@ -2483,6 +2640,9 @@ class _FunctionAnalyzer:
             self._assume(f"ignore:{declared}", f"call {declared} is declared data-irrelevant in the "
                                                f"policy (adapter.ignore_calls); it was not analyzed")
             return  # explicit, user-declared: data-irrelevant, and recorded as an assumption
+        if self._apply_effects_claim(call, display_name, line):
+            return
+        self._apply_ensures_claim(call)   # a guard fact only; the call is still classified
         # A refused declaration (handed a db handle/row/query/callable, or refuted by the
         # callee's visible body) contributes nothing: classify the call as undeclared.
         if self._session_lifecycle(call):
@@ -2526,7 +2686,7 @@ class _FunctionAnalyzer:
         }
         free = self._free(call)
         if (contains_query or query_names) and not free:
-            self._opaque(f"{display_name}(...)", "dynamic_query_helper", line)
+            self._opaque(f"{display_name}(...)", "dynamic_query_helper", line, node=call)
             return
         ref, bound_method = self._strict_ref(call)
         row_arg = any(
@@ -2539,7 +2699,7 @@ class _FunctionAnalyzer:
                 # A wrapper we cannot read may add effects, swallow the helper's
                 # denials, or not run the body at all: do not model the body as if it
                 # were what the call does.
-                self._opaque(f"{display_name}(...)", "decorated_helper", line)
+                self._opaque(f"{display_name}(...)", "decorated_helper", line, node=call)
                 return
             # Inline the identified helper.  The child analyzer is total itself, so
             # whatever it could not model comes back as opaque.
@@ -2547,7 +2707,7 @@ class _FunctionAnalyzer:
             return
         if free:
             return  # proven unable to read or write a modeled table
-        self._opaque(f"{display_name}(...)", "source_unavailable", line)
+        self._opaque(f"{display_name}(...)", "source_unavailable", line, node=call)
 
     def _update_row(self, var, line):
         if var in self.rows and var not in self.updated:

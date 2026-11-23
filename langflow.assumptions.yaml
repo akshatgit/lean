@@ -1,0 +1,85 @@
+# Assumptions for the Langflow demo scan (../langflow at 21381e5b29).
+# Hand-written in phase A from a read of the cited source; phase B will draft these.
+# Every entry is UNREVIEWED: results that use one are amber until `keyhole review` is run.
+schema: 1
+assumptions:
+  # ---- the service locator -------------------------------------------------------------
+  - id: LF-001
+    target: {symbol: langflow.services.deps.get_service}
+    claim: {effects: []}
+    evidence:
+      file: src/backend/base/langflow/services/deps.py
+      lines: [40, 62]
+      quote: "return service_manager.get(service_type, default)"
+      note: >-
+        Returns the cached service instance (lfx/services/manager.py:123-128). On first use
+        it CONSTRUCTS the service through its registered factory; I did not read every
+        service constructor, so "touches no mapped table" is verified for the lookup path
+        only. That gap is why this must stay unreviewed until someone checks the factories.
+    drafted_by: {tool: hand-written, note: phase A demo}
+  - id: LF-002
+    target: {symbol: lfx.services.deps.get_service}
+    claim: {effects: []}
+    evidence:
+      file: src/lfx/src/lfx/services/deps.py
+      lines: [40, 66]
+      note: Same locator on the lfx side; same caveat about first-use construction as LF-001.
+    drafted_by: {tool: hand-written, note: phase A demo}
+
+  # ---- what the unannotated getters return ---------------------------------------------
+  - id: LF-010
+    target: {symbol: langflow.services.deps.get_job_service}
+    claim: {returns_type: langflow.services.jobs.service.JobService}
+    evidence:
+      file: src/backend/base/langflow/services/jobs/factory.py
+      lines: [7, 14]
+      quote: "super().__init__(JobService)"
+    drafted_by: {tool: hand-written, note: phase A demo}
+  - id: LF-011
+    target: {symbol: langflow.services.deps.get_flow_events_service}
+    claim: {returns_type: langflow.services.flow_events.service.FlowEventsService}
+    evidence:
+      file: src/backend/base/langflow/services/flow_events/factory.py
+      lines: [14, 20]
+      quote: "return FlowEventsService(cache_dir=settings_service.settings.cache_dir)"
+    drafted_by: {tool: hand-written, note: phase A demo}
+  - id: LF-012
+    target: {symbol: langflow.services.deps.get_memory_base_service}
+    claim: {returns_type: langflow.services.memory_base.service.MemoryBaseService}
+    evidence:
+      file: src/backend/base/langflow/services/memory_base/factory.py
+      lines: [7, 14]
+      quote: "return MemoryBaseService()"
+    drafted_by: {tool: hand-written, note: phase A demo}
+  - id: LF-013
+    target: {symbol: langflow.services.deps.get_background_execution_service}
+    claim: {returns_type: langflow.services.background_execution.service.BackgroundExecutionService}
+    evidence:
+      file: src/backend/base/langflow/services/background_execution/factory.py
+      lines: [16, 22]
+      quote: "return BackgroundExecutionService(settings_service)"
+    drafted_by: {tool: hand-written, note: phase A demo}
+  - id: LF-014
+    target: {symbol: langflow.services.deps.get_telemetry_writer_service}
+    claim: {returns_type: langflow.services.telemetry_writer.service.TelemetryWriterService}
+    evidence:
+      file: src/backend/base/langflow/services/telemetry_writer/factory.py
+      lines: [14, 20]
+      quote: "return TelemetryWriterService(settings_service)"
+    drafted_by: {tool: hand-written, note: phase A demo}
+  - id: LF-015
+    target: {symbol: lfx.services.deps.get_model_provider_policy_service}
+    claim: {returns_type: lfx.services.model_provider_policy.base.BaseModelProviderPolicyService}
+    evidence:
+      file: src/lfx/src/lfx/services/deps.py
+      lines: [75, 84]
+      quote: "if not isinstance(service, BaseModelProviderPolicyService) or not service.ready: raise TypeError"
+    drafted_by: {tool: hand-written, note: phase A demo}
+  - id: LF-016
+    target: {symbol: lfx.services.deps.get_integration_policy_service}
+    claim: {returns_type: lfx.services.integration_policy.base.BaseIntegrationPolicyService}
+    evidence:
+      file: src/lfx/src/lfx/services/deps.py
+      lines: [87, 96]
+      quote: "if not isinstance(service, BaseIntegrationPolicyService) or not service.ready: raise TypeError"
+    drafted_by: {tool: hand-written, note: phase A demo}
