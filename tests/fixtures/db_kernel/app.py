@@ -23,6 +23,7 @@ class Peer(SQLModel, table=True):
 
 
 class TicketBase(SQLModel):
+    __mapper_args__ = {"confirm_deleted_rows": False}
     ticket_number: int = Field(primary_key=True)
 
 

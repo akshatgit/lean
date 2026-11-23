@@ -681,9 +681,17 @@ class Purity:
                 names = {t.id for t in targets if isinstance(t, ast.Name)}
                 repeated.update(names & declarations)
                 declarations.update(names)
-                if names & {"__mapper_args__", "__table__"}:
+                if "__table__" in names:
                     return None
                 value = item.value
+                if "__mapper_args__" in names:
+                    # This warning setting has no bearing on the mapper's identity.
+                    if not (isinstance(value, ast.Dict) and all(
+                        isinstance(k, ast.Constant) and k.value == "confirm_deleted_rows"
+                        and isinstance(v, ast.Constant) and isinstance(v.value, bool)
+                        for k, v in zip(value.keys, value.values)
+                    )):
+                        return None
                 if value is None:
                     continue
                 for call in (n for n in ast.walk(value) if isinstance(n, ast.Call)):
