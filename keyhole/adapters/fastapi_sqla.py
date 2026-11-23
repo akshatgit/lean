@@ -54,7 +54,7 @@ TYPE_MAP = {"int": "int", "str": "str", "bool": "bool", "UUID": "uuid", "uuid": 
 IGNORED_CALLS = {
     "str", "int", "bool", "len", "max", "min", "getattr", "setattr", "hasattr",
     "isinstance", "dict", "list", "set", "tuple", "frozenset", "sorted", "any", "all",
-    "next", "callable", "print", "super", "UUID", "Path", "BytesIO", "StringIO", "col",
+    "next", "callable", "print", "super", "UUID", "Path", "BytesIO", "StringIO",
     "Response", "JSONResponse", "StreamingResponse", "HTMLResponse", "RedirectResponse",
     "FileResponse", "PlainTextResponse", "HTTPException",
 }
@@ -1481,12 +1481,20 @@ class _FunctionAnalyzer:
                     # NOT field x of the row being selected.
                     return None
                 return _FieldTerm(e.attr, base)
-        if (isinstance(e, ast.Call) and (_dotted(e.func) or "").split(".")[-1] == "col"
-                and len(e.args) == 1):
+        if isinstance(e, ast.Call) and self._sql_wrapper(e) == "col" and len(e.args) == 1:
             return self.term(e.args[0], query_model=query_model)
         if (isinstance(e, ast.Call) and _dotted(e.func) in ("str", "int", "UUID", "uuid.UUID")
                 and len(e.args) == 1):
             return self.term(e.args[0], query_model=query_model)
+        return None
+
+    def _sql_wrapper(self, call):
+        if not self.index or call.keywords or any(isinstance(arg, ast.Starred) for arg in call.args):
+            return None
+        identity = self.index.purity.identity(self._pctx(), call.func)
+        if identity and identity[0] == "ext" and identity[1] in {
+                "sqlmodel.col", "sqlalchemy.and_", "sqlmodel.and_", "sqlalchemy.or_", "sqlmodel.or_"}:
+            return identity[1].rsplit(".", 1)[1]
         return None
 
     def _sql_null_test(self, column, model):
@@ -1527,10 +1535,11 @@ class _FunctionAnalyzer:
             left = self.cond(e.left, query_model=query_model)
             right = self.cond(e.right, query_model=query_model)
             return air.and_(left, right) if isinstance(e.op, ast.BitAnd) else air.or_(left, right)
-        if isinstance(e, ast.Call) and _dotted(e.func) in ("and_", "sqlalchemy.and_"):
-            return air.and_(*[self.cond(a, query_model=query_model) for a in e.args])
-        if isinstance(e, ast.Call) and _dotted(e.func) in ("or_", "sqlalchemy.or_"):
-            return air.or_(*[self.cond(a, query_model=query_model) for a in e.args])
+        if isinstance(e, ast.Call) and e.args:
+            wrapper = self._sql_wrapper(e)
+            if wrapper in {"and_", "or_"}:
+                combine = air.and_ if wrapper == "and_" else air.or_
+                return combine(*[self.cond(a, query_model=query_model) for a in e.args])
         raise _Unsupported("filter clause")
 
     def neg(self, e):
@@ -1676,6 +1685,9 @@ class _FunctionAnalyzer:
                 # widens the selector; applying the same rule to OR would narrow it.
                 if isinstance(condition, ast.BinOp) and isinstance(condition.op, ast.BitAnd):
                     pending.extend((condition.right, condition.left))
+                    continue
+                if isinstance(condition, ast.Call) and condition.args and self._sql_wrapper(condition) == "and_":
+                    pending.extend(reversed(condition.args))
                     continue
                 try:
                     state.conds.append(self.cond(condition, query_model=state.model))
@@ -2210,7 +2222,7 @@ class _FunctionAnalyzer:
                 receiver_type = self.index.global_types.get((self.module, receiver))
             if method in KNOWN_NON_DB_TYPED_METHODS.get(receiver_type or "", set()):
                 return True
-        if (name or "").split(".")[-1] in {"col", "and_", "or_"}:
+        if self._sql_wrapper(call):
             return True
         if self._ignored_call(name) or name in self.models:
             return True

@@ -2,6 +2,7 @@
 (the authorization is really there -> SAFE) and a negative twin (it is not -> VIOLATION)."""
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import and_ as all_conditions
 from sqlmodel import Field, SQLModel, col, func, select, update
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -198,6 +199,31 @@ async def nullable_owner(doc_id: int, session=Depends(get_session), user=Depends
 @router.get("/conditional/partial-sql-and")
 async def partial_sql_and(session=Depends(get_session), user=Depends(get_current_user)):
     return (await session.exec(select(Doc).where((Doc.id > 0) & (Doc.owner_id == user.id)))).all()
+
+
+@router.get("/conditional/imported-and")
+async def imported_and(session=Depends(get_session), user=Depends(get_current_user)):
+    stmt = select(Doc).where(all_conditions(Doc.id > 0, Doc.owner_id == user.id))
+    return (await session.exec(stmt)).all()
+
+
+def and_(first, second):
+    return first
+
+
+@router.get("/conditional/local-and")
+async def local_and(q: str, session=Depends(get_session), user=Depends(get_current_user)):
+    stmt = select(Doc).where(and_(Doc.title == q, Doc.owner_id == user.id))
+    return (await session.exec(stmt)).all()
+
+
+@router.get("/conditional/local-col")
+async def local_col(session=Depends(get_session), user=Depends(get_current_user)):
+    def col(value):
+        return Doc.id
+
+    stmt = select(Doc).where(col(Doc.owner_id) == user.id)
+    return (await session.exec(stmt)).all()
 
 
 @router.get("/conditional/partial-sql-or")

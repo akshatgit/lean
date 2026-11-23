@@ -27,6 +27,7 @@ def kernel():
 
 
 POSITIVE = [
+    "GET /conditional/imported-and",
     "GET /owned-projection",
     "GET /optional-checked/{doc_id}",
     "GET /conditional/partial-sql-and",
@@ -43,6 +44,8 @@ POSITIVE = [
 ]
 
 NEGATIVE = [
+    ("GET /conditional/local-and", "read"),
+    ("GET /conditional/local-col", "read"),
     ("GET /optional-bypassed/{doc_id}", "read"),
     ("GET /conditional/partial-sql-or", "read"),
     ("GET /conditional/python-and", "read"),
