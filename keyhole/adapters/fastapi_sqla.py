@@ -697,6 +697,11 @@ class _FunctionAnalyzer:
         self.run_models: dict[str, frozenset[str]] = {}
         self.returned_models: set[str] = set()
         self.run_bounds = {}
+        # Condition proofs are tied to individual AST use sites, never to a
+        # variable spelling that could survive a rebind or a control-flow join.
+        self.access_writes = {}
+        self.access_loads = {}
+        self.access_calls = set()
         self.returned_row = None
         self.returned_rows: list[dict | None] = []
         self.dependency_params: list[tuple[str, str, str]] = []  # (param, dependency, module)
@@ -1774,6 +1779,8 @@ class _FunctionAnalyzer:
         enclosing_bounds, self.run_bounds = self.run_bounds, {}
         try:
             for i, s in enumerate(stmts):
+                if isinstance(s, ast.If):
+                    self._access_helper_use(stmts, i)
                 if isinstance(s, ast.If) and i and i + 2 < len(stmts):
                     self._nullified_run(stmts[i - 1], s, stmts[i + 1], stmts[i + 2])
                 if self._try_throw_collectors:
@@ -2136,8 +2143,18 @@ class _FunctionAnalyzer:
                     list(self.global_guards), line,
                 )
                 q.effect_emitted = True
+            checked = self.access_loads.get(id(value))
+            if checked and effect and selector == air.eq(air.fld("id"), air.param(checked[0])):
+                _, guard, provenance = checked
+                effect.guards.append(guard)
+                effect.assumed_from = provenance
+            else:
+                checked = None
             if q.terminal is None and self._returns_row(value):
                 self.rows[target.id] = self._query_row(q, effect, line)
+                if checked:
+                    self.rows[target.id]["guards"].append(guard)
+                    self.rows[target.id]["assumed_from"] = provenance
             elif q.terminal is None:
                 self.query_results[target.id] = q
             return
@@ -2217,7 +2234,13 @@ class _FunctionAnalyzer:
                 self._mark_unresolved_calls(value, "database mutation")
                 r = self.rows[var]
                 self.updated.add(var)
-                self._emit("update", r["model"], r["selector"], list(r["guards"]), line, r["assumed_from"])
+                guards = list(r["guards"])
+                assumed = r["assumed_from"]
+                if id(target) in self.access_writes:
+                    guard, key = self.access_writes[id(target)]
+                    guards.append(guard)
+                    assumed = key or assumed
+                self._emit("update", r["model"], r["selector"], guards, line, assumed)
 
     def _new_instance_model(self, value) -> str | None:
         """Model name if `value` is `Model.<factory>(source, ...)` and the result is
@@ -2378,11 +2401,166 @@ class _FunctionAnalyzer:
             return name if name in self.policy.helper_guards else None
         return self.index.purity.binding_key(self._pctx(), call, self.policy.helper_guards)
 
+    def _gated_assignment(self, stmts, i, negative):
+        """The next use executed only after a successful check, and any id cleared."""
+        check = stmts[i]
+        use = check.body[0]
+        clear = None
+        if negative:
+            if check.orelse or len(check.body) != 1 or i + 1 >= len(stmts):
+                return None, None
+            denial = check.body[0]
+            use = stmts[i + 1]
+            if not isinstance(denial, (ast.Raise, ast.Return)):
+                # A nullable id only carries the fact after an explicit non-null
+                # check eliminates the alternative on which it was cleared.
+                if not (isinstance(denial, ast.Assign) and len(denial.targets) == 1
+                        and isinstance(denial.targets[0], ast.Name)
+                        and isinstance(denial.value, ast.Constant) and denial.value.value is None):
+                    return None, None
+                clear = denial.targets[0]
+                if not (isinstance(use, ast.If) and self._none_test(use.test, clear.id, ast.Is)
+                        and not use.orelse and len(use.body) == 1
+                        and isinstance(use.body[0], (ast.Raise, ast.Return)) and i + 2 < len(stmts)):
+                    return None, None
+                use = stmts[i + 2]
+
+        if not (isinstance(use, ast.Assign) and len(use.targets) == 1):
+            return None, None
+        return use, clear
+
+    def _access_helper_use(self, stmts, i):
+        """Bind a truthy helper result to an adjacent use that it dominates."""
+        check = stmts[i]
+        test = check.test
+        negative = isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not)
+        call = test.operand if negative else test
+        if self.index is None or not isinstance(call, ast.Call):
+            return
+        ref, method = self._strict_ref(call)
+        if ref and (isinstance(ref.node, ast.AsyncFunctionDef)
+                    or any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in ast.walk(ref.node))):
+            # Truth-testing a coroutine or generator does not execute its body.
+            # Keep uncertain effects opaque (including wrappers and nested defs)
+            # and analyze argument expressions in the usual pre-branch pass.
+            self._visited.add(id(call))
+            self._opaque(ast.unparse(call.func), "deferred_helper_in_condition", check.lineno, node=call)
+            return
+        if (self.helper_mode or not self.policy or any(isinstance(arg, ast.Starred) for arg in call.args)
+                or any(kw.arg is None for kw in call.keywords)):
+            return
+        use, clear = self._gated_assignment(stmts, i, negative)
+        if use is None:
+            return
+        target = use.targets[0]
+        # A finally suite can be analyzed several times with different bindings.
+        self.access_calls.discard(id(call))
+        self.access_writes.pop(id(target), None)
+        self.access_loads.pop(id(use.value), None)
+        if self.principal_rebound or not self.principal:
+            return
+        actuals = [*call.args, *(kw.value for kw in call.keywords)]
+        principal = air.principal(self.policy.id_attr)
+        principal_args = [arg for arg in actuals
+                          if _dotted(arg) in {self.principal, f"{self.principal}.{self.policy.id_attr}"}]
+        if len(principal_args) != 1:
+            return
+        if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+            row = target.value.id
+            if row not in self.rows or clear is not None or not isinstance(use.value, (ast.Name, ast.Constant)):
+                return
+            if ref:
+                # A freshly fetched instance: no intervening code could have
+                # overwritten its owner before the helper tested it.
+                load = stmts[i - 1] if i else None
+                if not (isinstance(load, ast.Assign) and len(load.targets) == 1
+                        and _dotted(load.targets[0]) == row and isinstance(load.value, ast.Call)
+                        and isinstance(load.value.func, ast.Attribute) and load.value.func.attr == "get"
+                        and _dotted(load.value.func.value) in self.db_vars
+                        and self.rows[row]["line"] == load.lineno):
+                    return
+                entity = load.value.args[0] if load.value.args else None
+                model = self.index.purity.identity(self._pctx(), entity)
+                if not model or model[0] != "class":
+                    return
+                pred = self._returned_owner(ref, method, call, row, principal_args[0], model[1])
+                if pred is not None:
+                    self.access_writes[id(target)] = (pred, None)
+                return
+        elif not (isinstance(target, ast.Name) and isinstance(use.value, ast.Call)):
+            return
+
+        # An untyped helpers: entry has no formal argument positions. Only
+        # accept one principal id and one object, plus an optional DB handle.
+        if ref:
+            return
+        identity = self.index.purity.identity(self._pctx(), call.func)
+        key = self._helper_key(call)
+        if not identity or identity[0] != "ext" or key is None:
+            return
+        provenance = f"helper-guard:{key}"
+        objects = [arg for arg in actuals if arg is not principal_args[0]
+                   and not (isinstance(arg, ast.Name) and arg.id in self.db_vars)]
+        if len(objects) != 1 or not isinstance(objects[0], ast.Name):
+            return
+        obj = objects[0].id
+        pred = self.policy.helper_guards[key]
+        if isinstance(target, ast.Attribute):
+            if obj != row:
+                return
+            self.access_writes[id(target)] = (pred, provenance)
+        else:
+            member = pred.get("member") if isinstance(pred, dict) else None
+            if (not member or member[1:] != [principal, air.fld("id")] or obj not in self.ep.params
+                    or (clear is not None and obj != clear.id)):
+                return
+            # term(Name) names the original endpoint input. Do not identify
+            # a later value with it. The one admitted store is eliminated above.
+            expected = ["param", "assign"] if clear is not None else ["param"]
+            if [kind for kind, _ in self._pctx().bindings.get(obj, [])] != expected:
+                return
+            self.access_loads[id(use.value)] = (obj, air.member(member[0], principal, air.param(obj)), provenance)
+        self.access_calls.add(id(call))
+        self._assume(provenance, f"policy models {key} solely as an access check whose truthy "
+                                 "result authorizes the supplied principal and object")
+
+    def _returned_owner(self, ref, method, call, row, principal_arg, model):
+        """Inline just the truth value of a synchronous single-return equality.
+        Normal repo-helper analysis independently accounts for the call's effects."""
+        fn = ref.node
+        if (method or not isinstance(fn, ast.FunctionDef) or fn.decorator_list or len(fn.body) != 1
+                or fn.args.kwarg or fn.args.vararg or not isinstance(fn.body[0], ast.Return)
+                or any(arg is not principal_arg and not isinstance(arg, (ast.Name, ast.Constant))
+                       for arg in [*call.args, *(kw.value for kw in call.keywords)])):
+            return None
+        expr = fn.body[0].value
+        if not (isinstance(expr, ast.Compare) and len(expr.ops) == 1 and isinstance(expr.ops[0], ast.Eq)):
+            return None
+        bound = self._bound_arguments(fn, call)
+        a, b = expr.left, expr.comparators[0]
+        for field, actor in ((a, b), (b, a)):
+            if not (isinstance(field, ast.Attribute) and isinstance(field.value, ast.Name)
+                    and _dotted(bound.get(field.value.id)) == row):
+                continue
+            if isinstance(actor, ast.Attribute) and actor.attr == self.policy.id_attr:
+                actual = bound.get(actor.value.id) if isinstance(actor.value, ast.Name) else None
+                matches = actual is principal_arg and isinstance(actual, ast.Name)
+            else:
+                actual = bound.get(actor.id) if isinstance(actor, ast.Name) else None
+                matches = actual is principal_arg and isinstance(actual, ast.Attribute)
+            if not matches:
+                continue
+            purity = self.index.purity
+            if (purity._is_mapped_column(model, field.attr)
+                    and purity._field_type(model, field.attr) in {("val", "int"), ("val", "str")}):
+                return air.eq(air.fld(field.attr), air.principal(self.policy.id_attr))
+        return None
+
     def _trusted_helper(self, name: str | None, call) -> bool:
         if not self.policy or not name:
             return False
         key = self._helper_key(call)
-        if key is None:
+        if key is None or self._strict_ref(call)[0] is not None:
             return False
         self._assume(f"helper-guard:{key}",
                      f"helper {key} is declared in the policy to enforce a guard (not verified against its body)")
@@ -3055,7 +3233,7 @@ class _FunctionAnalyzer:
                     selector, guards = bound[1], [bound[2]]
                 self._emit("execute", model, selector, guards, line)
 
-    def _helper(self, var, call, line):
+    def _helper(self, var, call, line, *, statement=False):
         """Classify one call that is not a recognised query.  Every exit either models
         the call, proves it effect-free, or records an effect-capable opaque."""
         self._visited.add(id(call))
@@ -3077,7 +3255,11 @@ class _FunctionAnalyzer:
         # callee's visible body) contributes nothing: classify the call as undeclared.
         if self._session_lifecycle(call):
             return  # transaction control on the session itself: no row is selected
-        if self._trusted_helper(name, call):
+        # Bare statements retain the legacy normal-return contract. Evaluating
+        # a boolean expression, including a nested one, grants nothing by itself.
+        if statement and self._trusted_helper(name, call):
+            return
+        if id(call) in self.access_calls:
             return
         if name in self.summaries:
             s = self.summaries[name]
@@ -3193,9 +3375,9 @@ class _FunctionAnalyzer:
                         for kind in kinds:
                             self._emit(kind, model, True, list(self.global_guards), line)
                         return
-        self._expr_effects(call, line)
+        self._expr_effects(call, line, statement=True)
 
-    def _expr_effects(self, e, line):
+    def _expr_effects(self, e, line, *, statement=False):
         if isinstance(e, ast.Await):
             e = e.value
         if isinstance(e, ast.Call):
@@ -3206,7 +3388,7 @@ class _FunctionAnalyzer:
                     # merely built here stays unvisited and is caught by the sweep.
                     self._record_executed_query(e, q, line)
             elif _dotted(e.func) not in self.models:
-                self._helper("_ret", e, line)
+                self._helper("_ret", e, line, statement=statement)
 
     def _record_executed_query(self, call, query, line):
         self._mark_spine(call)

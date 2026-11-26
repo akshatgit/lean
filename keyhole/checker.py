@@ -37,7 +37,7 @@ def core_binary() -> str:
 @dataclass
 class EffectResult:
     effect: object
-    verdict: str              # safe | violation | unknown
+    verdict: str              # safe | safe_assumed | violation | possible_violation | unknown
     witness: dict | None = None
     why: str | None = None
     blocking_calls: list[str] = field(default_factory=list)
@@ -95,6 +95,8 @@ def check_endpoints(endpoints: list, policy: Policy) -> list:
         for j, e in enumerate(ep.effects):
             r = verdicts[f"{i}:{j}"]
             verdict = r["verdict"]
+            if verdict == "safe" and e.assumed_from and e.assumed_from.startswith("helper-guard:"):
+                verdict = "safe_assumed"
             blockers = []
             if verdict == "violation":
                 blockers = sorted({
