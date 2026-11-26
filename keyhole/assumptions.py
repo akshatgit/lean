@@ -48,8 +48,8 @@ SCHEMA_VERSION = 1
 # engine change re-opens every review.
 SEMANTICS_VERSION = "2026.11-a"
 
-CLAIM_KINDS = ("returns_type", "effects", "ensures", "principal")
-EFFECT_KINDS = ("read", "update", "delete", "create")
+CLAIM_KINDS = ("returns_type", "effects", "ensures", "principal", "read_scope")
+EFFECT_KINDS = ("read", "update", "delete", "create", "execute")
 
 _ENTRY_KEYS = {"id", "target", "fingerprint", "claim", "evidence", "drafted_by", "review"}
 _TARGET_KEYS = {"symbol", "site", "params"}
@@ -245,12 +245,20 @@ def parse_entry(raw) -> Assumption:
         if "guard" not in payload or payload["guard"] in (True, False):
             _fail(entry_id, "ensures needs a guard predicate")
         _check_pred(entry_id, payload["guard"], "ensures guard")
+    elif kind == "read_scope":
+        fields = {"relation", "principal", "object_param"}
+        _only_keys(entry_id, "read_scope", payload, fields)
+        if not site or set(payload) != fields or not all(
+                isinstance(v, str) and v.isidentifier() for v in payload.values()):
+            _fail(entry_id, "read_scope requires a site and named relation, principal and object_param")
     elif kind == "principal":
         if payload is not True:
             _fail(entry_id, "principal must be true")
 
     fingerprint = raw.get("fingerprint") or {}
     _only_keys(entry_id, "fingerprint", fingerprint, _FINGERPRINT_KEYS)
+    if kind == "read_scope" and not fingerprint.get("sha256"):
+        _fail(entry_id, "read_scope needs the enclosing site fingerprint")
     evidence = raw.get("evidence") or {}
     _only_keys(entry_id, "evidence", evidence, _EVIDENCE_KEYS)
     drafted_by = raw.get("drafted_by") or {}

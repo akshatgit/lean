@@ -116,14 +116,23 @@ def _python_files(repo: Path, include_tests: bool = False):
 
 
 def _module_name(repo: Path, path: Path) -> str:
-    parts = [] if path.name == "__init__.py" else [path.stem]
-    parent = path.parent
-    while (parent / "__init__.py").exists():
-        parts.insert(0, parent.name)
-        parent = parent.parent
-    if parts:
-        return ".".join(parts)
-    return ".".join(path.relative_to(repo).with_suffix("").parts)
+    if not path.is_absolute():
+        repo, path = repo.absolute(), path.absolute()
+    # A regular package can contain namespace subpackages without __init__.py.
+    # Preserve the intervening directories so absolute and relative imports agree.
+    root = None
+    for directory in path.parents:
+        if (directory / "__init__.py").is_file():
+            root = directory.parent
+        if directory == repo:
+            break
+    if root is None:
+        return path.stem
+    # A scan may start inside an importable package. Keep its regular parents.
+    while root != root.parent and (root / "__init__.py").is_file():
+        root = root.parent
+    relative = path.relative_to(root).with_suffix("")
+    return ".".join(relative.parts[:-1] if path.name == "__init__.py" else relative.parts)
 
 
 @dataclass
@@ -498,6 +507,7 @@ class _QueryState:
     terminal: str | None = None
     executed: bool = False
     effect_emitted: bool = False
+    sqlmodel_entity_select: bool = False
 
 
 @dataclass
@@ -511,6 +521,7 @@ class _HelperAnalysis:
     # The statement a statement-builder helper returns (built, not executed), if every
     # return path returns one for the same model.
     returned_query: object = None
+    returned_models: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -524,6 +535,7 @@ class _AnalysisState:
     var_types: dict
     updated: set
     unresolved_values: dict
+    run_models: dict[str, frozenset[str]]
     principal_rebound: bool
     global_assumed_from: str | None = None
 
@@ -680,6 +692,11 @@ class _FunctionAnalyzer:
         self.updated = set()
         self.unresolved_values: dict[str, tuple[str, int]] = {}
         self.conditional_depth = 0
+        # May-provenance for execution, including detached DTOs and nullable rows.
+        # This never makes a value an ORM row or constrains a physical read.
+        self.run_models: dict[str, frozenset[str]] = {}
+        self.returned_models: set[str] = set()
+        self.run_bounds = {}
         self.returned_row = None
         self.returned_rows: list[dict | None] = []
         self.dependency_params: list[tuple[str, str, str]] = []  # (param, dependency, module)
@@ -924,7 +941,7 @@ class _FunctionAnalyzer:
         if name == self.principal:
             self.principal_rebound = True
         for table in (self.rows, self.creates, self.queries, self.query_results, self.values,
-                      self.var_types):
+                      self.var_types, self.run_models):
             table.pop(name, None)
         self.updated.discard(name)
         self.model_aliases.pop(name, None)
@@ -1149,10 +1166,11 @@ class _FunctionAnalyzer:
             list(self.global_guards), copy.deepcopy(self.rows), copy.deepcopy(self.creates),
             copy.deepcopy(self.queries), copy.deepcopy(self.query_results), copy.deepcopy(self.values),
             dict(self.var_types), set(self.updated), dict(self.unresolved_values),
-            self.principal_rebound, self.global_assumed_from,
+            dict(self.run_models), self.principal_rebound, self.global_assumed_from,
         )
 
     def _restore(self, state: _AnalysisState):
+        self.run_models = dict(state.run_models)
         self.global_guards = list(state.global_guards)
         self.rows = copy.deepcopy(state.rows)
         self.creates = copy.deepcopy(state.creates)
@@ -1241,9 +1259,12 @@ class _FunctionAnalyzer:
         def bound_everywhere(table):
             return set.intersection(*(set(getattr(state, table)) for state in states))
 
-        row_names = bound_everywhere("rows")
+        merged.run_models = {}
+        for state in states:
+            for name, models in state.run_models.items():
+                merged.run_models[name] = merged.run_models.get(name, frozenset()) | models
         merged.rows = {}
-        for name in row_names:
+        for name in bound_everywhere("rows"):
             bindings = [state.rows[name] for state in states if name in state.rows]
             merged.rows[name] = self._merge_row_bindings(bindings)
 
@@ -1263,6 +1284,7 @@ class _FunctionAnalyzer:
             item = copy.deepcopy(variants[0])
             if all(variant.model == item.model and variant.terminal == item.terminal
                    for variant in variants):
+                item.sqlmodel_entity_select = all(q.sqlmodel_entity_select for q in variants)
                 item.conds = self._merge_query_filters(variants)
                 item.executed = all(variant.executed for variant in variants)
                 item.effect_emitted = all(variant.effect_emitted for variant in variants)
@@ -1274,6 +1296,7 @@ class _FunctionAnalyzer:
             variants = [state.query_results[name] for state in states if name in state.query_results]
             item = copy.deepcopy(variants[0])
             if all(variant.model == item.model for variant in variants):
+                item.sqlmodel_entity_select = all(q.sqlmodel_entity_select for q in variants)
                 item.conds = self._merge_query_filters(variants)
                 merged.query_results[name] = item
 
@@ -1327,7 +1350,8 @@ class _FunctionAnalyzer:
         if any(q.model != first.model or q.terminal != first.terminal for q in queries):
             return
         self.returned_query = _QueryState(
-            first.model, self._merge_query_filters(queries), first.terminal)
+            first.model, self._merge_query_filters(queries), first.terminal,
+            sqlmodel_entity_select=all(q.sqlmodel_entity_select for q in queries))
         for spine in self._returned_query_spines:
             self._visited.update(spine)
 
@@ -1615,6 +1639,15 @@ class _FunctionAnalyzer:
         raise _Unsupported("guard")
 
     # ---------- queries ----------
+    def _sqlmodel_entity_select(self, call):
+        if not self.index or len(call.args) != 1 or call.keywords:
+            return False
+        purity, ctx = self.index.purity, self._pctx()
+        if purity.identity(ctx, call.func) != ("ext", "sqlmodel.select"):
+            return False
+        entity = purity.identity(ctx, call.args[0])
+        return bool(entity and entity[0] == "class" and purity.is_model_class(entity[1]))
+
     def query(self, e):
         """Return a conservatively accumulated query, including named statements."""
         if isinstance(e, ast.Await):
@@ -1624,7 +1657,7 @@ class _FunctionAnalyzer:
             if state:
                 return _QueryState(
                     state.model, list(state.conds), state.terminal,
-                    state.executed, state.effect_emitted,
+                    state.executed, state.effect_emitted, state.sqlmodel_entity_select,
                 )
             return None
         if not isinstance(e, ast.Call):
@@ -1644,7 +1677,9 @@ class _FunctionAnalyzer:
             if f.id != "select" and self._model_of(e.args[0]) is None:
                 return None   # update()/delete() must name their table directly
             terminal = f.id if f.id in ("delete", "update") else None
-            return _QueryState(next(iter(entities)) if entities else None, terminal=terminal)
+            whole_entity = self._sqlmodel_entity_select(e)
+            return _QueryState(next(iter(entities)) if entities else None, terminal=terminal,
+                               sqlmodel_entity_select=whole_entity)
         if not isinstance(f, ast.Attribute):
             return self._helper_query(e)
         recv = _dotted(f.value)
@@ -1736,8 +1771,11 @@ class _FunctionAnalyzer:
         """Analyze until control exits. Return whether the block can fall through."""
         if conditional:
             self.conditional_depth += 1
+        enclosing_bounds, self.run_bounds = self.run_bounds, {}
         try:
-            for s in stmts:
+            for i, s in enumerate(stmts):
+                if isinstance(s, ast.If) and i and i + 2 < len(stmts):
+                    self._nullified_run(stmts[i - 1], s, stmts[i + 1], stmts[i + 2])
                 if self._try_throw_collectors:
                     self._try_throw_collectors[-1].append(self._snapshot())
                 try:
@@ -1753,6 +1791,7 @@ class _FunctionAnalyzer:
                     return False
             return True
         finally:
+            self.run_bounds = enclosing_bounds
             if conditional:
                 self.conditional_depth -= 1
 
@@ -1985,10 +2024,24 @@ class _FunctionAnalyzer:
                 self._mark_unresolved_uses(s.value, "returned_response")
                 self._mark_unresolved_calls(s.value, "returned response")
                 value = s.value.value if isinstance(s.value, ast.Await) else s.value
+                source = value
+                if (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
+                        and value.func.attr == "model_validate" and len(value.args) == 1):
+                    # Possible origin only. Validation may transform the row.
+                    source = value.args[0]
+                if isinstance(source, ast.Name):
+                    self.returned_models.update(self.run_models.get(source.id, ()))
                 if isinstance(value, ast.Name) and value.id in self.rows:
                     returned = copy.deepcopy(self.rows[value.id])
-                self._expr_effects(s.value, s.lineno)
                 built = self.query(value) if isinstance(value, (ast.Call, ast.Name)) else None
+                if built and built.executed and isinstance(value, ast.Call):
+                    effect = self._record_executed_query(value, built, s.lineno)
+                    # SQLModel exec(select(Entity)).first() returns the mapped entity.
+                    # A column projection or SQLAlchemy execute(...).first() does not.
+                    if effect and built.terminal is None and built.sqlmodel_entity_select and self._direct_exec_first(value):
+                        returned = self._query_row(built, effect, s.lineno)
+                elif built is None:
+                    self._expr_effects(s.value, s.lineno)
                 if built is not None and not built.executed and built.model is not None:
                     self.returned_queries.append(built)
                     self._returned_query_spines.append([id(n) for n in self._spine(value)])
@@ -2026,7 +2079,15 @@ class _FunctionAnalyzer:
             before = [table.get(name) for table in tables]
             self.var_types.pop(name, None)
             alias_model, alias_column = self.model_aliases.get(name), self.column_aliases.get(name)
-            self._assign_name(target, value, line)
+            origins = self.run_models.get(value.id) if isinstance(value, ast.Name) else None
+            models = self._assign_name(target, value, line) or origins or frozenset()
+            row = self.rows.get(name)
+            if row is not None and row is not before[0]:
+                models = models | {row["model"]}
+            if models:
+                self.run_models[name] = models
+            else:
+                self.run_models.pop(name, None)
             if name == self.principal:
                 self.principal_rebound = True
             # the parameter no longer holds the model/column it was called with
@@ -2076,13 +2137,7 @@ class _FunctionAnalyzer:
                 )
                 q.effect_emitted = True
             if q.terminal is None and self._returns_row(value):
-                self.rows[target.id] = {
-                    "model": q.model, "selector": selector,
-                    "guards": list(self.global_guards), "line": line,
-                    "assumed_from": None, "read_emitted": True,
-                    "effect": effect,
-                    "effect_id": getattr(effect, "_analysis_id", None),
-                }
+                self.rows[target.id] = self._query_row(q, effect, line)
             elif q.terminal is None:
                 self.query_results[target.id] = q
             return
@@ -2133,13 +2188,14 @@ class _FunctionAnalyzer:
             return
         if isinstance(value, ast.Call):
             before = (len(self.ep.effects), len(self.ep.opaque), len(self.rows))
-            self._helper(target.id, value, line)
+            returned_models = self._helper(target.id, value, line)
             after = (len(self.ep.effects), len(self.ep.opaque), len(self.rows))
             if (before == after and not self._ignored_call(_dotted(value.func))
                     and not self._known_value_call(value)):
                 self.unresolved_values[target.id] = (
                     f"{_dotted(value.func) or ast.unparse(value.func)}(...)", line
                 )
+            return returned_models
         return
 
     def _assign_attribute(self, target, value, line):
@@ -2203,6 +2259,20 @@ class _FunctionAnalyzer:
         if any(purity.is_model_class(sub) for sub in purity._descendants(typ[1])):
             return None
         return name
+
+    def _query_row(self, query, effect, line):
+        return {"model": query.model, "selector": air.and_(*query.conds),
+                "guards": list(self.global_guards), "line": line, "assumed_from": None,
+                "read_emitted": True, "effect": effect,
+                "effect_id": getattr(effect, "_analysis_id", None)}
+
+    def _direct_exec_first(self, call):
+        if call.args or call.keywords or not isinstance(call.func, ast.Attribute) or call.func.attr != "first":
+            return False
+        receiver = call.func.value
+        execute = receiver.value if isinstance(receiver, ast.Await) else receiver
+        return (isinstance(execute, ast.Call) and isinstance(execute.func, ast.Attribute)
+                and execute.func.attr == "exec" and _dotted(execute.func.value) in self.db_vars)
 
     @staticmethod
     def _returns_row(value):
@@ -2373,11 +2443,11 @@ class _FunctionAnalyzer:
             return air.member(value[0], subject, obj) if subject is not None and obj is not None else True
         return True
 
-    def _analyze_repo_helper(self, ref, var, call, line, skip_first: bool = False) -> bool:
+    def _analyze_repo_helper(self, ref, var, call, line, skip_first: bool = False):
         qualified = ".".join(x for x in (ref.module, ref.owner_class, ref.node.name) if x)
         if self.depth >= MAX_HELPER_DEPTH or qualified in self.call_stack:
             self._opaque(f"{qualified}(...)", "recursion_or_depth_limit", line, target=qualified)
-            return True
+            return frozenset()
         analysis, bound = self._helper_analysis(ref, call, skip_first)
         self._apply_helper_analysis(analysis, bound, var, line,
                                     self.index.purity.call_target(self._pctx(), call), call, ref.file)
@@ -2385,8 +2455,7 @@ class _FunctionAnalyzer:
             # The helper hands back a statement that nothing here tracks: whoever
             # executes it does so outside the model.
             self._opaque(f"{qualified}(...)", "returned_statement_untracked", line)
-        return bool(analysis.effects or analysis.opaque or analysis.returned_row or analysis.row_guards
-                    or analysis.returned_query)
+        return analysis.returned_models
 
     def _helper_query(self, call):
         """If `call` is a statement-builder helper (an identified, undecorated repository
@@ -2505,16 +2574,35 @@ class _FunctionAnalyzer:
                 copy.deepcopy(child.ep.effects), copy.deepcopy(child.ep.opaque),
                 copy.deepcopy(child.ep.unmodeled_checks), copy.deepcopy(child.returned_row),
                 copy.deepcopy(row_guards), dict(child.ep.assumptions),
-                copy.deepcopy(child.returned_query),
+                copy.deepcopy(child.returned_query), frozenset(child.returned_models),
             )
             self.index.summary_cache[cache_key] = copy.deepcopy(analysis)
         return analysis, bound
+
+    def _site_read_scope(self, call):
+        """Conditional fact for reads inside this call. Caller parameters name the
+        authorized object independently of the rows the callee actually selects."""
+        if self.depth or self.policy is None or self.principal_rebound:
+            return None
+        entry = self._claim(call, "read_scope")
+        if entry is None or entry.fingerprint["sha256"] != entry.target_sha256:
+            return None
+        claim = entry.claim
+        obj = claim["object_param"]
+        if claim["principal"] != self.principal or obj not in self.ep.params:
+            return None
+        ctx = self._pctx()
+        for name in (obj, self.principal):
+            if [kind for kind, _ in ctx.bindings.get(name, [])] != ["param"]:
+                return None
+        return entry
 
     def _apply_helper_analysis(self, analysis, bound, var, line, symbol, call, source_file):
         site = self._call_site(call)
         self.ep.helper_sites.add(site)
         copied_effects = []
         effect_by_child_id = {}
+        scope = self._site_read_scope(call) if analysis.effects else None
         for effect in analysis.effects:
             child_id = getattr(effect, "_analysis_id", None)
             copied = copy.deepcopy(effect)
@@ -2523,6 +2611,11 @@ class _FunctionAnalyzer:
                 *self.global_guards,
                 *(self._substitute_pred(g, bound) for g in copied.guards),
             ]
+            if scope and copied.kind == "read":
+                copied.guards.append(air.member(scope.claim["relation"], air.principal(self.policy.id_attr),
+                                                air.param(scope.claim["object_param"])))
+                self._assume_entry(scope)
+                copied.assumed_from = copied.assumed_from or scope.key
             copied.assumed_from = copied.assumed_from or self.global_assumed_from
             copied.line = line
             copied.helper_site = site
@@ -2889,11 +2982,85 @@ class _FunctionAnalyzer:
                 and f.attr in {"commit", "flush", "refresh", "rollback", "close", "begin",
                                "begin_nested"})
 
+    @staticmethod
+    def _none_test(test, name, op):
+        return (isinstance(test, ast.Compare) and len(test.ops) == 1
+                and isinstance(test.ops[0], op) and _dotted(test.left) == name
+                and isinstance(test.comparators[0], ast.Constant)
+                and test.comparators[0].value is None)
+
+    def _nullified_run(self, load, check, denial, stmt):
+        """A surviving row satisfies the mismatch check at an adjacent runner.
+        Restrict the proof to this call node: no intervening rebind, mutation,
+        helper, alternative lookup or DTO conversion can inherit the equality."""
+        if self.helper_mode or check.orelse or len(check.body) != 1:
+            return
+        clear = check.body[0]
+        if not (isinstance(clear, ast.Assign) and len(clear.targets) == 1
+                and isinstance(clear.targets[0], ast.Name)
+                and isinstance(clear.value, ast.Constant) and clear.value.value is None):
+            return
+        name = clear.targets[0].id
+        row = self.rows.get(name)
+        if (row is None or row["line"] != load.lineno or not isinstance(load, ast.Assign)
+                or name == self.principal or self.principal_rebound):
+            return
+        value = load.value.value if isinstance(load.value, ast.Await) else load.value
+        if not (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
+                and value.func.attr == "get" and _dotted(value.func.value) in self.db_vars):
+            return
+        test = check.test
+        if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And) and len(test.values) == 2:
+            exists, test = test.values
+            if not self._none_test(exists, name, ast.IsNot):
+                return
+        if not (isinstance(test, ast.Compare) and len(test.ops) == 1
+                and isinstance(test.ops[0], ast.NotEq) and isinstance(test.left, ast.Attribute)
+                and _dotted(test.left.value) == name):
+            return
+        caller = test.comparators[0]
+        if not (isinstance(caller, ast.Attribute) and isinstance(caller.value, ast.Name)
+                and caller.value.id == self.principal):
+            return
+        if not (isinstance(denial, ast.If) and not denial.orelse
+                and self._none_test(denial.test, name, ast.Is) and len(denial.body) == 1
+                and isinstance(denial.body[0], (ast.Return, ast.Raise))):
+            return
+        if not isinstance(stmt, (ast.Expr, ast.Return, ast.Assign, ast.AnnAssign)):
+            return
+        call = stmt.value.value if isinstance(stmt.value, ast.Await) else stmt.value
+        if (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                and all(isinstance(arg, (ast.Name, ast.Constant))
+                        for arg in [*call.args, *(kw.value for kw in call.keywords)])):
+            guard = air.eq(air.fld(test.left.attr), air.principal(caller.attr))
+            self.run_bounds[id(call), name] = (row["model"], row["selector"], guard)
+
+    def _run_effect(self, call, line):
+        """Named run/execute conventions on an argument with a known load origin.
+        Keep analyzing the runner itself for other effects and opacity."""
+        verb, _, subject = (_dotted(call.func) or "").split(".")[-1].partition("_")
+        if verb not in {"run", "execute"}:
+            return
+        for arg in [*call.args[:1], *(kw.value for kw in call.keywords)]:
+            if not isinstance(arg, ast.Name):
+                continue
+            for model in sorted(self.run_models.get(arg.id, ())):
+                if subject and subject.split("_")[0].lower() != model.lower():
+                    continue
+                bound = self.run_bounds.get((id(call), arg.id))
+                row = self.rows.get(arg.id)
+                selector = row["selector"] if row and row["model"] == model else True
+                guards = []
+                if bound and bound[0] == model:
+                    selector, guards = bound[1], [bound[2]]
+                self._emit("execute", model, selector, guards, line)
+
     def _helper(self, var, call, line):
         """Classify one call that is not a recognised query.  Every exit either models
         the call, proves it effect-free, or records an effect-capable opaque."""
         self._visited.add(id(call))
         name = _dotted(call.func)
+        self._run_effect(call, line)
         display_name = name or ast.unparse(call.func)[:80]
         for value in [*call.args, *(kw.value for kw in call.keywords)]:
             if isinstance(value, (ast.Call, ast.Await)):
@@ -2966,8 +3133,7 @@ class _FunctionAnalyzer:
                 return
             # Inline the identified helper.  The child analyzer is total itself, so
             # whatever it could not model comes back as opaque.
-            self._analyze_repo_helper(ref, var, call, line, bound_method)
-            return
+            return self._analyze_repo_helper(ref, var, call, line, bound_method)
         if free:
             return  # proven unable to read or write a modeled table
         self._opaque(f"{display_name}(...)", "source_unavailable", line, node=call)
@@ -3045,8 +3211,8 @@ class _FunctionAnalyzer:
     def _record_executed_query(self, call, query, line):
         self._mark_spine(call)
         if not query.effect_emitted:
-            self._emit(query.terminal or "read", query.model, air.and_(*query.conds),
-                       list(self.global_guards), line)
+            return self._emit(query.terminal or "read", query.model, air.and_(*query.conds),
+                              list(self.global_guards), line)
 
     def _emit(self, kind, model, selector, guards, line, assumed_from=None):
         effect = air.Effect(

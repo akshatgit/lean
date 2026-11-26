@@ -17,7 +17,10 @@ AIR_VERSION = 1
 Term = dict
 Pred = Any  # bool | dict
 
-KINDS = ("read", "update", "delete", "create")
+# Verb vocabulary. Open by design: the Lean core checks each (resource, kind) generically
+# (rows-touched ⊆ rows-allowed), so a new verb here + in the core's parseKind is a sound
+# extension. `execute` is the first non-CRUD verb (e.g. running a private flow).
+KINDS = ("read", "update", "delete", "create", "execute")
 PARAM_SOURCES = ("path", "query", "body", "header", "cookie")
 PARAM_TYPES = ("uuid", "int", "str", "bool", "other")
 PRINCIPAL_VIA = ("dependency", "middleware", "external", "none")

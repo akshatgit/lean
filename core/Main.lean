@@ -54,6 +54,7 @@ def parseKind : String → Except String Kind
   | "update" => pure .update
   | "delete" => pure .delete
   | "create" => pure .create
+  | "execute" => pure .execute
   | k => throw s!"bad kind: {k}"
 
 def parseRule (j : Json) : Except String Rule := do

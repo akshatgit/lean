@@ -312,3 +312,72 @@ def test_external_policy_validation_and_provenance(tmp_path, capsys):
     page = report.html_report([], policy)
     assert "generated_by=external test generator" in page
     assert "status=unconfirmed" in page
+
+
+@pytest.mark.parametrize(("statement", "has_row"), [
+    ("stmt = select(Document)", True),
+    ("stmt = select(Document.title)", False),
+    ("stmt = select(Document)\n    if flag:\n        stmt = select(Document.title)", False),
+])
+def test_direct_sqlmodel_helper_return_preserves_only_entity_updates(tmp_path, statement, has_row):
+    (tmp_path / "models.py").write_text("class Document:\n    __tablename__ = 'documents'\n")
+    (tmp_path / "app.py").write_text(f"""from fastapi import APIRouter, Depends
+from sqlmodel import select
+from models import Document
+
+router = APIRouter()
+def get_db(): pass
+
+async def lookup(session, flag):
+    {statement}
+    return (await session.exec(stmt)).first()
+
+@router.patch('/document')
+async def edit(flag: bool, session=Depends(get_db)):
+    item = await lookup(session, flag)
+    if item:
+        item.title = 'revised'
+""")
+    (tmp_path / "keyhole.policy.yaml").write_text("resources: {Document: {read: true, update: false}}")
+    result, = scan(tmp_path)
+    kinds = [e.effect.kind for e in result.effects if e.effect.resource == "Document"]
+    assert kinds.count("read") == 1
+    assert ("update" in kinds) == has_row
+
+
+@pytest.mark.parametrize("import_path", ["sample.models.catalog", "..models.catalog"])
+def test_namespace_helpers_keep_qualified_identity(tmp_path, import_path):
+    package = tmp_path / "backend" / "sample"
+    for folder in ["models", "routers", "other"]:
+        (package / folder).mkdir(parents=True)
+    (package / "__init__.py").touch()
+    (package / "models" / "catalog.py").write_text("""
+class Item:
+    __tablename__ = 'items'
+
+class Catalog:
+    def lookup(self, session, key):
+        return session.get(Item, key)
+
+catalog = Catalog()
+""")
+    (package / "other" / "catalog.py").write_text("""
+class Catalog:
+    def lookup(self, session, key):
+        return None
+
+catalog = Catalog()
+""")
+    (package / "routers" / "catalog.py").write_text(f"""from fastapi import APIRouter, Depends
+from {import_path} import catalog
+
+router = APIRouter()
+def get_db(): pass
+
+@router.get('/items')
+def items(key: int, session=Depends(get_db)):
+    return catalog.lookup(session, key)
+""")
+    (tmp_path / "keyhole.policy.yaml").write_text("resources: {Item: {read: false}}")
+    result, = scan(tmp_path)
+    assert [(e.effect.kind, e.effect.resource) for e in result.effects] == [("read", "Item")]

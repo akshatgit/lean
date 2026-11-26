@@ -48,8 +48,14 @@ def Pred.eval (env : Env) : Pred → Bool
   | .and p q      => p.eval env && q.eval env
   | .or p q       => p.eval env || q.eval env
 
+-- Verbs are an open vocabulary: `Kind` is only ever used as an equality key in
+-- `Policy.rule` (deny-by-default lookup of the allow-predicate for a resource+kind).
+-- No proof or `check` step pattern-matches on a specific constructor, so adding a verb
+-- is sound by construction -- the safety theorem (`Safe`) is generic over `kind`.
+-- Keyhole is therefore not restricted to CRUD/IDOR: any verb a policy names (execute,
+-- and later manage, send, ...) is a first-class, proven object-access check.
 inductive Kind where
-  | read | update | delete | create
+  | read | update | delete | create | execute
   deriving DecidableEq, Repr, Inhabited
 
 structure Effect where

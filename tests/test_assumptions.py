@@ -352,3 +352,43 @@ def test_scan_refuses_verdicts_when_a_source_file_cannot_be_parsed(repo):
     with pytest.raises(SystemExit, match=r"dependency\.py:1 with Python"):
         main(["scan", str(repo), "--format", "json", "--out", str(output)])
     assert not output.exists()
+
+
+def test_read_scope_only_constrains_reads_inside_pinned_call(tmp_path):
+    app = tmp_path / "app.py"
+    app.write_text("""from fastapi import APIRouter, Depends
+from sqlalchemy import select
+class Item:
+    __tablename__ = 'items'
+router = APIRouter()
+def get_user(): pass
+def get_db(): pass
+def listing(db, box):
+    scoped = db.execute(select(Item).where(Item.box == box)).first()
+    other = db.execute(select(Item)).first()
+    return scoped
+@router.get('/items')
+def handler(box: str, user=Depends(get_user), db=Depends(get_db)):
+    db.execute(select(Item).where(Item.box == box))
+    return listing(db, box)
+""")
+    (tmp_path / "keyhole.policy.yaml").write_text(
+        "resources: {Item: {confirmed: true, read: 'member(box_read, box)'}}")
+    claim = {"id": "R", "target": {"site": {"function": "app.handler", "callee": "listing"}},
+             "fingerprint": {"kind": "site", "sha256": "stale"},
+             "claim": {"read_scope": {"relation": "box_read", "principal": "user", "object_param": "box"}}}
+    path = tmp_path / "keyhole.assumptions.yaml"
+    path.write_text(yaml.safe_dump({"schema": 1, "assumptions": [claim]}))
+    results, entries, _, _ = scan(tmp_path)
+    assert entries.get("R").status == "stale"
+    assert not any(e.effect.guards for e in results["GET /items"].effects)
+    claim["fingerprint"]["sha256"] = entries.get("R").target_sha256
+    path.write_text(yaml.safe_dump({"schema": 1, "assumptions": [claim]}))
+    results, _, _, _ = scan(tmp_path)
+    result = results["GET /items"]
+    before, scoped, unscoped = result.effects
+    assert not before.effect.guards
+    assert scoped.verdict == "safe"
+    assert unscoped.verdict == "possible_violation"
+    assert scoped.effect.guards == unscoped.effect.guards
+    assert "assume:R" in result.provenance

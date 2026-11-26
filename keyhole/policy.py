@@ -18,6 +18,7 @@ Example:
 Rule expressions:
     owner(FIELD)            row.FIELD == principal.<id attr>
     member(FIELD)           the caller is in relation `member` with row.FIELD
+    member(REL, FIELD)      the caller is in named relation REL with row.FIELD
     FIELD == 'const'        row.FIELD equals a constant
     FIELD == principal.X    row.FIELD equals a principal attribute
     true | false, and, or, parentheses
@@ -33,7 +34,7 @@ import yaml
 
 from . import air
 
-_TOKEN = re.compile(r"\s*(\(|\)|==|'[^']*'|\"[^\"]*\"|[A-Za-z_][A-Za-z0-9_.]*|\d+)")
+_TOKEN = re.compile(r"\s*(\(|\)|,|==|'[^']*'|\"[^\"]*\"|[A-Za-z_][A-Za-z0-9_.]*|\d+)")
 
 
 class PolicyError(ValueError):
@@ -112,12 +113,18 @@ class _Parser:
         if tok in ("owner", "member", "is_null") and self.peek() == "(":
             self.take("(")
             f = self.take()
+            relation = "member"
+            if tok == "member" and self.peek() == ",":
+                self.take(",")
+                relation, f = f, self.take()
+                if not all(name.isidentifier() for name in (relation, f)):
+                    raise PolicyError("member expects a relation name and a field name")
             self.take(")")
             if tok == "is_null":
                 return air.eq(air.fld(f), air.const(None))
             if tok == "owner":
                 return air.eq(air.fld(f), air.principal(self.id_attr))
-            return air.member("member", air.principal(self.id_attr), air.fld(f))
+            return air.member(relation, air.principal(self.id_attr), air.fld(f))
         lhs = self.term(tok, side="lhs")
         self.take("==")
         rhs = self.term(self.take(), side="rhs")
