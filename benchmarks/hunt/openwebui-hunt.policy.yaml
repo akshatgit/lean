@@ -1,0 +1,28 @@
+# Hunt policy: owner-scoped intent for open-webui per-user private resources.
+# Confirmed so the checker can reach the `violation` tier. Resources with real
+# sharing models (Chat, Folder, Knowledge, Channel) will over-flag shared access;
+# that is handled in code-level triage, not here.
+principal:
+  id: user.id
+  dependencies: [get_verified_user, get_current_user]
+resources:
+  Chat:            {confirmed: true, read: owner(user_id), update: owner(user_id), delete: owner(user_id), create: owner(user_id)}
+  ChatMessage:     {confirmed: true, read: owner(user_id), update: owner(user_id), delete: owner(user_id), create: owner(user_id)}
+  Message:         {confirmed: true, read: owner(user_id), update: owner(user_id), delete: owner(user_id), create: owner(user_id)}
+  Folder:          {confirmed: true, read: owner(user_id), update: owner(user_id), delete: owner(user_id), create: owner(user_id)}
+  File:            {confirmed: true, read: owner(user_id), update: owner(user_id), delete: owner(user_id), create: owner(user_id)}
+  Note:            {confirmed: true, read: owner(user_id), update: owner(user_id), delete: owner(user_id), create: owner(user_id)}
+  Knowledge:       {confirmed: true, read: owner(user_id), update: owner(user_id), delete: owner(user_id), create: owner(user_id)}
+  KnowledgeFile:   {confirmed: true, read: owner(user_id), update: owner(user_id), delete: owner(user_id), create: owner(user_id)}
+  KnowledgeDirectory: {confirmed: true, read: owner(user_id), update: owner(user_id), delete: owner(user_id), create: owner(user_id)}
+  Function:        {confirmed: true, read: owner(user_id), update: owner(user_id), delete: owner(user_id), create: owner(user_id)}
+  Tool:            {confirmed: true, read: owner(user_id), update: owner(user_id), delete: owner(user_id), create: owner(user_id)}
+  Prompt:          {confirmed: true, read: owner(user_id), update: owner(user_id), delete: owner(user_id), create: owner(user_id)}
+  Memory:          {confirmed: true, read: owner(user_id), update: owner(user_id), delete: owner(user_id), create: owner(user_id)}
+  Calendar:        {confirmed: true, read: owner(user_id), update: owner(user_id), delete: owner(user_id), create: owner(user_id)}
+  CalendarEvent:   {confirmed: true, read: owner(user_id), update: owner(user_id), delete: owner(user_id), create: owner(user_id)}
+  Automation:      {confirmed: true, read: owner(user_id), update: owner(user_id), delete: owner(user_id), create: owner(user_id)}
+  Feedback:        {confirmed: true, read: owner(user_id), update: owner(user_id), delete: owner(user_id), create: owner(user_id)}
+  Note_PinnedNote: {confirmed: true, read: owner(user_id), update: owner(user_id), delete: owner(user_id), create: owner(user_id)}
+  ApiKey:          {confirmed: true, read: owner(user_id), update: owner(user_id), delete: owner(user_id), create: owner(user_id)}
+  ChatFile:        {confirmed: true, read: owner(user_id), update: owner(user_id), delete: owner(user_id), create: owner(user_id)}

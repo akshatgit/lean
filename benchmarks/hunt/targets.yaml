@@ -1,0 +1,17 @@
+# Hunt targets. Each entry is scanned end-to-end by run_hunt.py with NO human gate
+# before the scan; the human confirms the ranked leads afterward.
+#
+#   name        label used for report filenames and --only
+#   clone       local git clone (git objects must contain `ref`)
+#   ref         what to scan (default origin/HEAD = latest master); pass --fetch to update
+#   policy      owner-scoped policy (repo-relative); confirm it post-hoc, not before
+#   assumptions optional assumptions file to supply facts about opaque code
+targets:
+  - name: langflow
+    clone: /home/akshat/Documents/langflow
+    ref: origin/HEAD
+    policy: benchmarks/hunt/langflow-hunt.policy.yaml
+  - name: openwebui
+    clone: /home/akshat/Documents/open-webui
+    ref: origin/HEAD
+    policy: benchmarks/hunt/openwebui-hunt.policy.yaml

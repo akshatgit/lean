@@ -1,0 +1,4 @@
+principal:
+  id: user.id
+  dependencies: [get_verified_user, get_current_user, get_admin_user]
+resources: {}
