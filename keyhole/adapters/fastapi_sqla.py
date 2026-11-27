@@ -527,6 +527,7 @@ class _HelperAnalysis:
 @dataclass
 class _AnalysisState:
     global_guards: list
+    void_global_guards: list
     rows: dict
     creates: dict
     queries: dict
@@ -688,6 +689,7 @@ class _FunctionAnalyzer:
         self.queries: dict[str, _QueryState] = {}
         self.query_results: dict[str, _QueryState] = {}
         self.global_guards = []
+        self.void_global_guards = []
         self.global_assumed_from = None
         self.updated = set()
         self.unresolved_values: dict[str, tuple[str, int]] = {}
@@ -720,6 +722,7 @@ class _FunctionAnalyzer:
         # Effects that exist only because a principal dependency fetched the caller.
         self._principal_effect_ids: set[int] = set()
         self.return_states: list[_AnalysisState] = []
+        self.inside_with = False
         self._try_throw_collectors: list[list[_AnalysisState]] = []
         self._next_effect_id = 0
         # Totality ledger: ids of ast.Call / store-target nodes that were positively
@@ -1168,7 +1171,8 @@ class _FunctionAnalyzer:
 
     def _snapshot(self) -> _AnalysisState:
         return _AnalysisState(
-            list(self.global_guards), copy.deepcopy(self.rows), copy.deepcopy(self.creates),
+            list(self.global_guards), list(self.void_global_guards),
+            copy.deepcopy(self.rows), copy.deepcopy(self.creates),
             copy.deepcopy(self.queries), copy.deepcopy(self.query_results), copy.deepcopy(self.values),
             dict(self.var_types), set(self.updated), dict(self.unresolved_values),
             dict(self.run_models), self.principal_rebound, self.global_assumed_from,
@@ -1177,6 +1181,7 @@ class _FunctionAnalyzer:
     def _restore(self, state: _AnalysisState):
         self.run_models = dict(state.run_models)
         self.global_guards = list(state.global_guards)
+        self.void_global_guards = list(state.void_global_guards)
         self.rows = copy.deepcopy(state.rows)
         self.creates = copy.deepcopy(state.creates)
         self.queries = copy.deepcopy(state.queries)
@@ -1253,6 +1258,7 @@ class _FunctionAnalyzer:
         merged = copy.deepcopy(states[0])
         merged.principal_rebound = any(state.principal_rebound for state in states)
         merged.global_guards = self._common_lists([state.global_guards for state in states])
+        merged.void_global_guards = self._common_lists([state.void_global_guards for state in states])
         merged.global_assumed_from = next(
             (state.global_assumed_from for state in states if state.global_assumed_from), None
         )
@@ -1641,7 +1647,183 @@ class _FunctionAnalyzer:
             if t is None:
                 raise _Unsupported("guard attribute")
             return air.eq(t, air.const("true"))
+        if isinstance(e, (ast.Call, ast.Await)):
+            guard = self._synth_call_guard(e)
+            if guard is not None:
+                return guard
         raise _Unsupported("guard")
+
+    def _guard_target(self, call, ctx=None, enclosing=()):
+        """Resolve an undecorated module function with known call and await conventions."""
+        awaited = isinstance(call, ast.Await)
+        if awaited:
+            call = call.value
+        if (not isinstance(call, ast.Call) or self.depth + len(enclosing) >= MAX_HELPER_DEPTH
+                or any(isinstance(arg, ast.Starred) for arg in call.args)
+                or any(kw.arg is None for kw in call.keywords)):
+            return None
+        # Explicit helper entries retain their existing use-site guard semantics.
+        if self._helper_key(call, ctx) is not None:
+            return None
+        ref, method = self._strict_ref(call, ctx)
+        if ref is None or ref.owner_class is not None or method:
+            return None
+        fn = ref.node
+        purity = self.index.purity
+        if (fn.decorator_list or not purity._decorators_ok(ref.module, fn, ref.owner_class)
+                or awaited != isinstance(fn, ast.AsyncFunctionDef)
+                or f"{ref.module}.{fn.name}" in self.call_stack.union(enclosing)
+                or fn.args.vararg or fn.args.kwarg
+                or len(call.args) > len(fn.args.posonlyargs) + len(fn.args.args)):
+            return None
+        return ref
+
+    def _synth_call_guard(self, call, ctx=None, outer_bound=None, enclosing=()):
+        """Compile the truthy path of a module-level boolean helper."""
+        ref = self._guard_target(call, ctx, enclosing)
+        if ref is None:
+            return None
+        fn = ref.node
+        call = call.value if isinstance(call, ast.Await) else call
+        body = fn.body[1:] if ast.get_docstring(fn) is not None else fn.body
+        if not body or not isinstance(body[-1], ast.Return) or body[-1].value is None:
+            return None
+        # A generator's body need not run. A walrus can invalidate the bindings
+        # used by a later operand, even when its own predicate would widen.
+        if any(isinstance(n, (ast.Yield, ast.YieldFrom, ast.NamedExpr))
+               for stmt in body for n in ast.walk(stmt)):
+            return None
+        expr = body[-1].value
+        for stmt in reversed(body[:-1]):
+            if (not isinstance(stmt, ast.If) or stmt.orelse or len(stmt.body) != 1
+                    or not isinstance(stmt.body[0], ast.Return)):
+                return None
+            value = stmt.body[0].value
+            if not isinstance(value, ast.Constant) or type(value.value) is not bool:
+                return None
+            if value.value:
+                expr = ast.BoolOp(op=ast.Or(), values=[stmt.test, expr])
+            # After an early False return the tail must hold. Drop the
+            # negative condition, equivalently conjoining the tail with True.
+        bound = self._bound_arguments(fn, call)
+        if outer_bound is not None:
+            bound = {name: self._guard_operand(actual, outer_bound) for name, actual in bound.items()}
+        ctx = self.index.purity.ctx_for(ref.module, fn, ref.owner_class)
+        guard = self._compile_bool(expr, bound, ctx)
+        return None if guard is True else guard
+
+    def _synth_void_guard(self, call):
+        """Every normal exit from this shape goes through the tested bare return."""
+        if self.inside_with:
+            return None
+        ref = self._guard_target(call)
+        if ref is None:
+            return None
+        fn = ref.node
+        body = fn.body[1:] if ast.get_docstring(fn) is not None else fn.body
+        if len(body) < 2 or not isinstance(body[-1], ast.Raise):
+            return None
+        first = body[0]
+        if (not isinstance(first, ast.If) or first.orelse or len(first.body) != 1
+                or not isinstance(first.body[0], ast.Return) or first.body[0].value is not None):
+            return None
+        if any(isinstance(n, (ast.Yield, ast.YieldFrom, ast.NamedExpr))
+               for stmt in body for n in ast.walk(stmt)):
+            return None
+        forbidden = (ast.Return, ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith,
+                    ast.Try, ast.Match, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        if any(isinstance(n, forbidden) or type(n).__name__ == "TryStar"
+               for stmt in body[1:] for n in ast.walk(stmt)):
+            return None
+        call = call.value if isinstance(call, ast.Await) else call
+        bound = self._bound_arguments(fn, call)
+        ctx = self.index.purity.ctx_for(ref.module, fn, None)
+        test = first.test
+        inner = test.value if isinstance(test, ast.Await) else test
+        if isinstance(inner, ast.Call) and self.index.purity.dispatch_targets(ctx, inner):
+            return self._synth_call_guard(test, ctx, bound, (f"{ref.module}.{fn.name}",))
+        pred = self._compile_bool(test, bound, ctx)
+        return None if pred is True else pred
+
+    def _guard_operand(self, expr, bound):
+        """Substitute only helper formals, once, without capturing caller names."""
+        if isinstance(expr, ast.Constant):
+            return expr
+        if isinstance(expr, ast.Name):
+            actual = bound.get(expr.id)
+        elif isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name):
+            base = bound.get(expr.value.id)
+            if not isinstance(base, ast.Name):
+                return None
+            actual = ast.Attribute(value=base, attr=expr.attr, ctx=ast.Load())
+        else:
+            return None
+        base = actual.value if isinstance(actual, ast.Attribute) else actual
+        if isinstance(base, ast.Name):
+            if base.id in self.ep.params and any(
+                    kind != "param" for kind, _ in self._pctx().bindings.get(base.id, [])):
+                return None
+            if isinstance(actual, ast.Attribute) and base.id in self.body_vars:
+                # term() interns body parameters. Synthesis only reads existing AIR.
+                if f"{base.id}.{actual.attr}" not in self.ep.params:
+                    return None
+        if isinstance(actual, (ast.Name, ast.Constant)) or (
+                isinstance(actual, ast.Attribute) and isinstance(base, ast.Name)):
+            return actual
+        return None
+
+    def _compile_bool(self, e, bound, ctx):
+        if isinstance(e, ast.BoolOp):
+            combine = air.and_ if isinstance(e.op, ast.And) else air.or_
+            return combine(*(self._compile_bool(v, bound, ctx) for v in e.values))
+        if isinstance(e, ast.Constant) and type(e.value) is bool:
+            return e.value
+        if isinstance(e, ast.Compare) and len(e.ops) == 1:
+            left = self._guard_operand(e.left, bound)
+            right = self._guard_operand(e.comparators[0], bound)
+            if isinstance(e.ops[0], ast.Is) and isinstance(right, ast.Constant) and right.value is None:
+                try:
+                    return self._null_guard(left)
+                except _Unsupported:
+                    return True
+            if isinstance(e.ops[0], ast.Eq):
+                a, b = self.term(left), self.term(right)
+                if a is not None and b is not None:
+                    return air.eq(a, b)
+            return True
+        if isinstance(e, (ast.Name, ast.Attribute)):
+            actual = self._guard_operand(e, bound)
+            if isinstance(actual, ast.Attribute):
+                try:
+                    return self.pos(actual)
+                except _Unsupported:
+                    pass
+            return True
+        if isinstance(e, ast.Await):
+            e = e.value
+        if not isinstance(e, ast.Call):
+            return True
+        if isinstance(e.func, ast.Name) and e.func.id == "getattr":
+            if (self.index.purity.identity(ctx, e.func) == ("builtin", "getattr")
+                    and not e.keywords and len(e.args) in (2, 3)
+                    and (len(e.args) == 2 or isinstance(e.args[2], ast.Constant) and not e.args[2].value)
+                    and isinstance(e.args[1], ast.Constant) and isinstance(e.args[1].value, str)):
+                base = self._guard_operand(e.args[0], bound)
+                if isinstance(base, ast.Name) and base.id == self.principal and not self.principal_rebound:
+                    return air.eq(air.principal(e.args[1].value), air.const(True))
+            return True
+        if not isinstance(e.func, (ast.Name, ast.Attribute)):
+            return True
+        relation = e.func.id if isinstance(e.func, ast.Name) else e.func.attr
+        keywords = {kw.arg: kw.value for kw in e.keywords}
+        if not e.args and keywords.keys() == {"user_id", "resource"}:
+            operands = [keywords["user_id"], keywords["resource"]]
+        elif len(e.args) == 2 and not keywords:
+            operands = e.args
+        else:
+            return True
+        a, b = (self.term(self._guard_operand(arg, bound)) for arg in operands)
+        return air.member(relation, a, b) if a is not None and b is not None else True
 
     # ---------- queries ----------
     def _sqlmodel_entity_select(self, call):
@@ -1832,14 +2014,24 @@ class _FunctionAnalyzer:
             pred = self._condition_pred(part, polarity)
             if pred is None or pred is True:
                 continue
-            sources = _field_rows(pred)
-            if not sources:
-                self.global_guards.append(pred)  # only params / principal / constants
-            elif len(sources) == 1 and next(iter(sources)) in self.rows:
-                self.rows[next(iter(sources))]["guards"].append(pred)
-            else:
-                self.ep.unmodeled_checks.append(air.UnmodeledCheck(
-                    f"cross-row guard dropped: {ast.unparse(part)[:100]}", line))
+            self._attach_guard(pred, line, part)
+
+    def _attach_guard(self, pred, line, test=None):
+        sources = _field_rows(pred)
+        if not sources:
+            self.global_guards.append(pred)
+            if test is None:
+                self.void_global_guards.append(pred)
+        elif len(sources) == 1 and next(iter(sources)) in self.rows:
+            row = self.rows[next(iter(sources))]
+            if pred not in row["guards"]:
+                row["guards"].append(pred)
+            if test is None and row.get("effect") is not None and pred not in row["effect"].guards:
+                row["effect"].guards.append(pred)
+        else:
+            reason = (f"cross-row guard dropped: {ast.unparse(test)[:100]}" if test is not None
+                      else "cross-row guard dropped (void helper)")
+            self.ep.unmodeled_checks.append(air.UnmodeledCheck(reason, line))
 
     def _analyze_if(self, s: ast.If) -> bool:
         base = self._snapshot()
@@ -1923,6 +2115,8 @@ class _FunctionAnalyzer:
         """Analyze one statement, then model the calls its own expressions contain that
         the statement handler did not consume (see `_model_calls_in`)."""
         falls_through = self._stmt_inner(s)
+        if isinstance(s, ast.Expr) and isinstance(s.value, (ast.Call, ast.Await)):
+            return falls_through  # bare calls account for their operands before attaching a guard
         if isinstance(s, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Expr, ast.Return,
                           ast.Raise, ast.Assert, ast.Delete)):
             own = [getattr(s, "value", None), getattr(s, "exc", None), getattr(s, "cause", None),
@@ -1969,7 +2163,12 @@ class _FunctionAnalyzer:
                     if item.optional_vars is not None:
                         for name in self._stored_names(item.optional_vars):
                             self._kill(name)
-                return self._block(s.body)
+                # __exit__ may suppress a denial and continue after this block.
+                enclosing_with, self.inside_with = self.inside_with, True
+                try:
+                    return self._block(s.body)
+                finally:
+                    self.inside_with = enclosing_with
             return True
         if isinstance(s, ast.Try):
             for handler in s.handlers:
@@ -2024,6 +2223,10 @@ class _FunctionAnalyzer:
             call = s.value.value if isinstance(s.value, ast.Await) else s.value
             if isinstance(call, ast.Call):
                 self._call(call, s.lineno)
+            self._model_calls_in([s.value], s.lineno)
+            guard = self._synth_void_guard(s.value)
+            if guard is not None:
+                self._attach_guard(guard, s.lineno)
             return True
         if isinstance(s, ast.Return):
             returned = None
@@ -2238,7 +2441,8 @@ class _FunctionAnalyzer:
                 assumed = r["assumed_from"]
                 if id(target) in self.access_writes:
                     guard, key = self.access_writes[id(target)]
-                    guards.append(guard)
+                    if guard not in guards:
+                        guards.append(guard)
                     assumed = key or assumed
                 self._emit("update", r["model"], r["selector"], guards, line, assumed)
 
@@ -2391,7 +2595,7 @@ class _FunctionAnalyzer:
             self._opaque(display, f"unresolved_result_in_{use.replace(' ', '_')}", call.lineno,
                          effects=False)
 
-    def _helper_key(self, call) -> str | None:
+    def _helper_key(self, call, ctx=None) -> str | None:
         """The policy `helpers:` entry naming THIS call, bound by spelling or resolved
         identity (never a bare leaf that resolves to unrelated repository code)."""
         if not (self.policy and self.policy.helper_guards):
@@ -2399,7 +2603,7 @@ class _FunctionAnalyzer:
         if self.index is None:
             name = _dotted(call.func)
             return name if name in self.policy.helper_guards else None
-        return self.index.purity.binding_key(self._pctx(), call, self.policy.helper_guards)
+        return self.index.purity.binding_key(self._pctx() if ctx is None else ctx, call, self.policy.helper_guards)
 
     def _gated_assignment(self, stmts, i, negative):
         """The next use executed only after a successful check, and any id cleared."""
@@ -3136,14 +3340,15 @@ class _FunctionAnalyzer:
         self.rows[row]["guards"].append(guard)
         self._assume_entry(entry)
 
-    def _strict_ref(self, call):
+    def _strict_ref(self, call, ctx=None):
         """The single repository definition `call` dispatches to, identified by import
         resolution or receiver type (never by method name alone).  None when the callee
         is unidentified or has overriding definitions."""
         if self.index is None:
             return None, False
         purity = self.index.purity
-        targets = purity.dispatch_targets(self._pctx(), call)
+        ctx = self._pctx() if ctx is None else ctx
+        targets = purity.dispatch_targets(ctx, call)
         if not targets or len(targets) != 1:
             return None, False
         module, node, owner = targets[0]
@@ -3151,7 +3356,7 @@ class _FunctionAnalyzer:
         ref = _FunctionRef(module, node, str(path.relative_to(self.index.repo)), owner)
         decorators = {_dotted(d) for d in node.decorator_list}
         bound_method = bool(owner) and "staticmethod" not in decorators and (
-            "classmethod" in decorators or not purity.receiver_is_class_object(self._pctx(), call))
+            "classmethod" in decorators or not purity.receiver_is_class_object(ctx, call))
         return ref, bound_method
 
     def _session_lifecycle(self, call) -> bool:
@@ -3397,6 +3602,9 @@ class _FunctionAnalyzer:
                               list(self.global_guards), line)
 
     def _emit(self, kind, model, selector, guards, line, assumed_from=None):
+        if kind in ("update", "delete"):
+            # A row can predate a global check that dominates this write.
+            guards = [*guards, *(pred for pred in self.void_global_guards if pred not in guards)]
         effect = air.Effect(
             kind, model, selector, guards, line,
             assumed_from or self.global_assumed_from,
